@@ -208,6 +208,8 @@ task<void> handle_rpc(uringpp::socket conn, size_t conn_id) {
         if (req_size > request.writable()) {
           request.expand(req_size - request.writable());
         }
+      } else if (request.writable() < kRPCRequestHeaderSize) {
+        request.expand(kRPCRequestHeaderSize - request.writable());
       }
     }
     if (state == kStateRecvBody) {
