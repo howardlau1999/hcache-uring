@@ -148,20 +148,20 @@ public:
        std::unordered_set<std::string_view>::iterator end) {
     std::vector<key_view_value> ret;
     for (auto it = begin; it != end; ++it) {
-      if (auto v = query(*it); v.has_value()) {
-        ret.emplace_back(*it, std::move(v.value()));
+      if (auto v = query(*it); v.first) {
+        ret.emplace_back(*it, std::string(v.first, v.second));
       }
     }
     return ret;
   }
 
   std::vector<key_value>
-  list(std::unordered_set<std::string>::iterator begin,
-       std::unordered_set<std::string>::iterator end) {
+  list(std::vector<std::string_view>::iterator begin,
+       std::vector<std::string_view>::iterator end) {
     std::vector<key_value> ret;
     for (auto it = begin; it != end; ++it) {
-      if (auto v = query(*it); v.has_value()) {
-        ret.emplace_back(std::move(*it), std::move(v.value()));
+      if (auto v = query(*it); v.first) {
+        ret.emplace_back(std::move(*it), std::string(v.first, v.second));
       }
     }
     return ret;
@@ -175,7 +175,7 @@ public:
 
   task<void> try_update_peer();
 
-  std::optional<std::string> query(std::string_view key);
+  std::pair<char*, size_t> query(std::string_view key);
   task<std::optional<std::string>>
   remote_query(size_t shard, std::string_view key);
 

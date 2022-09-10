@@ -45,6 +45,7 @@ add_subdirectory(third_party/libcds)
 add_subdirectory(third_party/uringpp)
 add_subdirectory(third_party/fmt)
 add_subdirectory(third_party/mimalloc)
+add_subdirectory(third_party/simdjson)
 set(BUILD_EXAMPLES OFF)
 set(BUILD_TESTING OFF)
 include_directories(third_party/rapidjson/include)
@@ -66,4 +67,5 @@ target_link_libraries(hcache
     uringpp
     fmt::fmt
     mimalloc-static
+    simdjson
 )

@@ -11,7 +11,6 @@ enum method : uint8_t {
   zadd,
   zrange,
   zrmv,
-  ping,
 };
 
 struct key_value {

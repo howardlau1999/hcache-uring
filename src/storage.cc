@@ -1,17 +1,16 @@
 #include "storage.h"
 
+#include <boost/algorithm/string/classification.hpp>
+#include <boost/algorithm/string/split.hpp>
 #include <cds/init.h>
 #include <cstdint>
 #include <filesystem>
+#include <fmt/format.h>
 #include <fstream>
 #include <memory>
 #include <mutex>
 #include <string_view>
 #include <vector>
-#include <fmt/format.h>
-#include <boost/algorithm/string/classification.hpp>
-#include <boost/algorithm/string/split.hpp>
-
 
 char const *kv_dir = "/data/kv";
 char const *zset_dir = "/data/zset";
@@ -36,9 +35,7 @@ storage::storage() : kv_initialized_(false), kv_initializing_(false) {
   zset_db_ = std::unique_ptr<rocksdb::DB>(db);
 }
 
-task<void> storage::start_rpc_server() {
- co_return; 
-}
+task<void> storage::start_rpc_server() { co_return; }
 
 void storage::open_kv_db() {
   fmt::print("Opening KV DB {}\n", kv_dir);
@@ -152,7 +149,6 @@ void storage::load_zset() {
   fmt::print("Loaded {} ZSET keys", count);
 }
 
-
 task<void> storage::try_update_peer() {
   // if (!co_await seastar::file_exists("/data/cluster.json")) {
   //   co_return;
@@ -176,24 +172,27 @@ task<void> storage::try_update_peer() {
   // }
   co_return;
 }
-std::optional<std::string> storage::query(std::string_view key) {
-  std::string ret_value;
+
+std::pair<char *, size_t> storage::query(std::string_view key) {
+  size_t ret_size = 0;
+  char *ret_value = nullptr;
   if (!cds::threading::Manager::isThreadAttached()) {
     cds::threading::Manager::attachThread();
   }
-  if (kvs_.find(key, [&](auto &kv, ...) { ret_value = kv.value; })) {
-    return ret_value;
-  }
-  return std::nullopt;
+  kvs_.find(key, [&](auto &kv, ...) {
+    ret_value = new char[kv.value.size()];
+    ret_size = kv.value.size();
+    std::copy_n(kv.value.data(), kv.value.size(), ret_value);
+  });
+  return {ret_value, ret_size};
 }
 
 void storage::add_no_persist(std::string_view key, std::string_view value) {
   if (!cds::threading::Manager::isThreadAttached()) {
     cds::threading::Manager::attachThread();
   }
-  if (kvs_.find(key, [value](auto &kv, ...) {
-        kv.value = std::string(value);
-      })) {
+  if (kvs_.find(key,
+                [value](auto &kv, ...) { kv.value = std::string(value); })) {
     return;
   }
   key_value_intl *kv = new key_value_intl(key, value);
@@ -224,7 +223,6 @@ void storage::del(std::string_view key) {
   zsets_.erase(key);
   kv_db_->Delete(get_write_options(), key);
 }
-
 
 void zset_intl::zadd(uint32_t score, std::string_view value) {
   if (!cds::threading::Manager::isThreadAttached()) {
