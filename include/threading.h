@@ -25,7 +25,7 @@ public:
     void await_suspend(std::coroutine_handle<> h) const noexcept {
       queue_.push(h);
       uint64_t val = 1;
-      ::write(efd_, &val, sizeof(val));
+      (void)::write(efd_, &val, sizeof(val));
     }
     void await_resume() const noexcept {}
   };
@@ -56,11 +56,6 @@ public:
     while (!t.h_.done()) {
       poll();
     }
-  }
-
-  void wake() {
-    uint64_t val = 1;
-    ::write(efd_, &val, sizeof(val));
   }
 
   uringpp::task<void> waker() {

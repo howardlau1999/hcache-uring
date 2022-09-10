@@ -74,6 +74,9 @@ task<void> send_worker(uringpp::socket &conn, std::list<output_page> &buffer,
     auto n = co_await conn.writev(&iovs[0], iovs.size());
     if (n <= 0) {
       closed = true;
+      if (n < 0) {
+        fmt::print("send error {}\n", std::strerror(-n));
+      }
       co_return;
     }
     auto it = buffer.begin();
@@ -639,9 +642,12 @@ task<void> rpc_recv_loop(uringpp::socket &rpc_conn) {
       }
     }
     if (state != kStateProcess) {
-      auto n =
-          co_await rpc_conn.recv(response.write_data(), response.writable());
+      auto n = co_await rpc_conn.recv(response.write_data(),
+                                      response.writable(), MSG_NOSIGNAL);
       if (n <= 0) {
+        if (n < 0) {
+          fmt::print("recv error: {}\n", strerror(-n));
+        }
         co_return;
       }
       response.advance_write(n);
@@ -759,7 +765,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
           // query
           std::string_view key(path + 7, path_len - 7);
           std::pair<char *, size_t> value;
-          if (false) {
+          if (rpc_clients[0].size() == 0) {
             value = store->query(key);
           } else {
             auto remote_value =
@@ -784,7 +790,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
         case 'd': {
           // del
           std::string_view key(path + 5, path_len - 5);
-          if (false) {
+          if (rpc_clients[0].size() == 0) {
             store->del(key);
           } else {
             co_await remote_del(rpc_clients[0][shard], key);
@@ -803,7 +809,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
           }
           auto const key = std::string_view(path + 6, slash_ptr - 1);
           auto const value = std::string_view(slash_ptr, end_ptr - slash_ptr);
-          if (false) {
+          if (rpc_clients[0].size() == 0) {
             store->zrmv(key, value);
           } else {
             co_await remote_zrmv(rpc_clients[0][shard], key, value);
@@ -836,7 +842,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
           auto doc = parser.parse(json);
           auto const key = doc["key"].get_string().take_value();
           auto const value = doc["value"].get_string().take_value();
-          if (false) {
+          if (rpc_clients[0].size() == 0) {
             store->add(key, value);
           } else {
             co_await remote_add(rpc_clients[0][shard], key, value);
@@ -851,7 +857,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
               simdjson::padded_string(body_start, content_length);
           auto doc = parser.parse(json);
           auto arr = doc.get_array().take_value();
-          if (false) {
+          if (rpc_clients[0].size() == 0) {
             for (auto &&kv : arr) {
               auto const key = kv["key"].get_string().take_value();
               auto const value = kv["value"].get_string().take_value();
@@ -877,12 +883,27 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
           auto doc = parser.parse(json);
           auto arr = doc.get_array().take_value();
           std::unordered_set<std::string_view> keys;
-          for (auto &&key : arr) {
-            keys.emplace(key.get_string().take_value());
+          std::vector<std::unordered_set<std::string_view>> sharded;
+          std::vector<std::vector<key_value>> remote_key_values;
+          if (rpc_clients[0].size() == 0) {
+            for (auto &&key : arr) {
+              keys.emplace(key.get_string().take_value());
+            }
+          } else {
+            sharded.resize(1);
+            for (auto &&key : arr) {
+              auto const key_str = key.get_string().take_value();
+              sharded[0].emplace(key_str);
+            }
           }
-          // auto key_values = store->list(keys.begin(), keys.end());
-          auto key_values = co_await remote_list(rpc_clients[0][shard], keys);
-          if (key_values.empty()) {
+          auto local_key_values = store->list(keys.begin(), keys.end());
+          auto remote_kv_count = 0;
+          for (auto &kvs : sharded) {
+            auto remote_kvs = co_await remote_list(rpc_clients[0][shard], kvs);
+            remote_kv_count += remote_kvs.size();
+            remote_key_values.emplace_back(std::move(remote_kvs));
+          }
+          if (local_key_values.empty() && remote_kv_count == 0) {
             send_all(conn, sending, closed, send_buf, pending_send_buf,
                      HTTP_404, sizeof(HTTP_404) - 1);
           } else {
@@ -891,20 +912,25 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
               auto d = rapidjson::Document();
               auto &kv_list = d.SetArray();
               auto &allocator = d.GetAllocator();
+              kv_list.Reserve(remote_kv_count + local_key_values.size(),
+                              allocator);
               auto write_kv = [&](std::string_view key,
                                   std::string_view value) {
-                auto &&kv_object = rapidjson::Value(rapidjson::kObjectType);
-                auto &&k_string = rapidjson::StringRef(key.data(), key.size());
-                auto &&v_string =
+                auto kv_object = rapidjson::Value(rapidjson::kObjectType);
+                auto k_string = rapidjson::StringRef(key.data(), key.size());
+                auto v_string =
                     rapidjson::StringRef(value.data(), value.size());
-                kv_object.AddMember("key", rapidjson::Value(k_string),
-                                    allocator);
-                kv_object.AddMember("value", rapidjson::Value(v_string),
-                                    allocator);
+                kv_object.AddMember("key", k_string, allocator);
+                kv_object.AddMember("value", v_string, allocator);
                 kv_list.PushBack(kv_object, allocator);
               };
-              for (auto &kv : key_values) {
+              for (auto &kv : local_key_values) {
                 write_kv(kv.key, kv.value);
+              }
+              for (auto &remote_kvs : remote_key_values) {
+                for (auto &kv : remote_kvs) {
+                  write_kv(kv.key, kv.value);
+                }
               }
               rapidjson::Writer<json_output_stream> writer(stream);
               d.Accept(writer);
@@ -924,7 +950,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
             auto score_value = parser.parse(json);
             auto value = score_value["value"].get_string().take_value();
             auto score = score_value["score"].get_uint64().take_value();
-            if (false) {
+            if (rpc_clients[0].size() == 0) {
               store->zadd(key, value, score);
             } else {
               co_await remote_zadd(rpc_clients[0][shard], key, value, score);
@@ -941,9 +967,15 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
             auto score_range = parser.parse(json);
             auto min_score = score_range["min_score"].get_uint64().take_value();
             auto max_score = score_range["max_score"].get_uint64().take_value();
-            // auto score_values = store->zrange(key, min_score, max_score);
-            auto score_values = co_await remote_zrange(
-                rpc_clients[0][shard], key, min_score, max_score);
+            auto score_values = co_await
+                [&]() -> task<std::optional<std::vector<score_value>>> {
+              if (rpc_clients[0].size() == 0) {
+                co_return store->zrange(key, min_score, max_score);
+              } else {
+                co_return co_await remote_zrange(rpc_clients[0][shard], key,
+                                                 min_score, max_score);
+              }
+            }();
             if (!score_values.has_value()) {
               send_all(conn, sending, closed, send_buf, pending_send_buf,
                        HTTP_404, sizeof(HTTP_404) - 1);
@@ -953,10 +985,12 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
                 auto d = rapidjson::Document();
                 auto &sv_list = d.SetArray();
                 auto &allocator = d.GetAllocator();
+                sv_list.Reserve(score_values->size(), allocator);
                 for (auto &kv : score_values.value()) {
-                  auto &&sv_object = rapidjson::Value(rapidjson::kObjectType);
-                  auto &&v_string =
+                  auto sv_object = rapidjson::Value(rapidjson::kObjectType);
+                  auto v_string =
                       rapidjson::StringRef(kv.value.data(), kv.value.size());
+                  sv_object["value"].SetString(v_string);
                   sv_object.AddMember("value", v_string, allocator);
                   sv_object.AddMember("score", kv.score, allocator);
                   sv_list.PushBack(sv_object, allocator);
@@ -1036,7 +1070,7 @@ task<void> connect_rpc_client(size_t peer_idx, std::string const &host,
 
 int main() {
   auto main_loop = uringpp::event_loop::create();
-  // ::signal(SIGPIPE, SIG_IGN);
+  ::signal(SIGPIPE, SIG_IGN);
   auto cores = get_cpu_affinity();
   loops.resize(cores.size());
   store = std::make_unique<storage>();
@@ -1069,9 +1103,9 @@ int main() {
       main_loop->poll();
     }
   });
-  connect_rpc_client(0, "127.0.0.1", "58080").detach();
-  while (clients_connected != cores.size() * 1) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-  }
+  // connect_rpc_client(0, "28.10.10.75", "58080").detach();
+  // while (clients_connected != cores.size() * 1) {
+  //   std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  // }
   return 0;
 }
