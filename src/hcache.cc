@@ -1051,9 +1051,9 @@ int main() {
                                           main_loop->fd());
       loops[i] = loop;
       loop_started.fetch_add(1);
+      loop->waker().detach();
       for (;;) {
-        loop->run_pending();
-        loop->poll_no_wait();
+        loop->poll();
       }
     });
     thread.detach();
@@ -1067,7 +1067,7 @@ int main() {
   std::jthread main_poll_thread([main_loop]() {
     for (;;) {
       main_loop->poll();
-   }
+    }
   });
   connect_rpc_client(0, "127.0.0.1", "58080").detach();
   while (clients_connected != cores.size() * 1) {

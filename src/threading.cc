@@ -1,5 +1,6 @@
 #include "threading.h"
 #include <fmt/format.h>
+#include <sys/eventfd.h>
 
 std::shared_ptr<loop_with_queue>
 loop_with_queue::create(unsigned int entries, uint32_t flags, int wq_fd) {
@@ -8,8 +9,13 @@ loop_with_queue::create(unsigned int entries, uint32_t flags, int wq_fd) {
 
 loop_with_queue::loop_with_queue(unsigned int entries, uint32_t flags,
                                  int wq_fd)
-    : uringpp::event_loop(entries, flags, wq_fd), queue_() {}
-
+    : uringpp::event_loop(entries, flags, wq_fd), queue_() {
+  efd_ = ::eventfd(0, 0);
+  if (efd_ < 0) {
+    throw std::runtime_error(
+        fmt::format("failed to create eventfd: {}", std::strerror(errno)));
+  }
+}
 
 std::vector<int> get_cpu_affinity() {
   std::vector<int> cores;
@@ -30,7 +36,7 @@ std::vector<int> get_cpu_affinity() {
 
 void bind_cpu(int core) {
   cpu_set_t cpuset;
-  
+
   CPU_ZERO(&cpuset);
   CPU_SET(core, &cpuset);
   if (auto rc =

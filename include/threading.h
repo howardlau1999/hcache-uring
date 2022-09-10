@@ -1,11 +1,11 @@
 #pragma once
 
-#include <vector>
 #include <boost/lockfree/policies.hpp>
 #include <boost/lockfree/queue.hpp>
 #include <coroutine>
 #include <memory>
 #include <uringpp/event_loop.h>
+#include <vector>
 
 void bind_cpu(int core);
 
@@ -19,15 +19,18 @@ class io_queue {
 public:
   struct thread_switch_awaitable {
     io_queue &queue_;
-    thread_switch_awaitable(io_queue &queue) : queue_(queue) {}
+    int efd_;
+    thread_switch_awaitable(io_queue &queue, int efd) : queue_(queue), efd_(efd) {}
     bool await_ready() const noexcept { return false; }
     void await_suspend(std::coroutine_handle<> h) const noexcept {
       queue_.push(h);
+      uint64_t val = 1;
+      ::write(efd_, &val, sizeof(val));
     }
     void await_resume() const noexcept {}
   };
 
-  thread_switch_awaitable queue_in_loop() { return {*this}; }
+  thread_switch_awaitable queue_in_loop(int efd) { return {*this, efd}; }
 
   void push(std::coroutine_handle<> h) { queue_.push(h); }
 
@@ -40,6 +43,7 @@ public:
 
 class loop_with_queue : public uringpp::event_loop {
   io_queue queue_;
+  int efd_ = -1;
 
 public:
   static std::shared_ptr<loop_with_queue>
@@ -50,8 +54,23 @@ public:
 
   template <class T> void block_on(uringpp::task<T> t) {
     while (!t.h_.done()) {
-      poll_no_wait();
+      poll();
+    }
+  }
+
+  void wake() {
+    uint64_t val = 1;
+    ::write(efd_, &val, sizeof(val));
+  }
+
+  uringpp::task<void> waker() {
+    for (;;) {
+      uint64_t val = 0;
+      int n = co_await this->read(efd_, &val, sizeof(val));
       run_pending();
+      if (n <= 0) {
+        co_return;
+      }
     }
   }
 
@@ -60,6 +79,6 @@ public:
   }
 
   io_queue::thread_switch_awaitable switch_to_io_thread() {
-    return queue_.queue_in_loop();
+    return queue_.queue_in_loop(efd_);
   }
 };
