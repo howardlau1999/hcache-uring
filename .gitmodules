@@ -16,3 +16,6 @@
 [submodule "third_party/fmt"]
 	path = third_party/fmt
 	url = https://github.com/fmtlib/fmt
+[submodule "third_party/mimalloc"]
+	path = third_party/mimalloc
+	url = https://github.com/microsoft/mimalloc
