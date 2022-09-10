@@ -698,8 +698,9 @@ task<void> rpc_recv_loop(uringpp::socket &rpc_conn) {
   }
 }
 
-task<void> rpc_server(std::shared_ptr<uringpp::event_loop> loop,
+task<void> rpc_server(std::shared_ptr<loop_with_queue> loop,
                       std::string const &port) {
+  co_await loop->switch_to_io_thread();
   size_t rpc_conn_id = 0;
   auto listener = uringpp::listener::listen(loop, "0.0.0.0", port);
   fmt::print("Starting RPC server\n");
@@ -772,6 +773,8 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
               request.expand(content_length - request.writable());
             }
           }
+        } else if (request.writable() == 0) {
+          request.expand(2048);
         }
       }
 
@@ -784,6 +787,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
       }
 
       if (parser_rc == -2 || receiving_body || request.readable() == 0) {
+        assert(request.writable() > 0);
         n = co_await conn.recv(request.write_data(), request.writable(),
                                MSG_NOSIGNAL);
         if (n <= 0) {
@@ -1113,7 +1117,8 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
   co_return;
 }
 
-task<void> http_server(std::shared_ptr<uringpp::event_loop> loop) {
+task<void> http_server(std::shared_ptr<loop_with_queue> loop) {
+  co_await loop->switch_to_io_thread();
   auto listener = uringpp::listener::listen(loop, "0.0.0.0", "8080");
   size_t conn_id = 0;
   fmt::print("Starting HTTP server\n");
