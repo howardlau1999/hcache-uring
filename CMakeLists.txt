@@ -69,3 +69,10 @@ target_link_libraries(hcache
     mimalloc-static
     simdjson
 )
+
+add_executable(pingpong src/pingpong.cc src/threading.cc)
+target_link_libraries(pingpong 
+  PRIVATE        
+    uringpp
+    fmt::fmt
+)

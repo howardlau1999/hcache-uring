@@ -14,6 +14,7 @@
 #include <fcntl.h>
 #include <fmt/format.h>
 #include <memory>
+#include <netinet/tcp.h>
 #include <picohttpparser/picohttpparser.h>
 #include <rapidjson/document.h>
 #include <rapidjson/rapidjson.h>
@@ -47,15 +48,17 @@ std::atomic<size_t> loop_started;
 std::atomic<size_t> clients_connected;
 std::unique_ptr<storage> store;
 
-const char HTTP_404[] = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
-const char HTTP_400[] = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
-const char OK_RESPONSE[] = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
-const char EMPTY_RESPONSE[] = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+const char HTTP_404[] = "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n";
+const char HTTP_400[] = "HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\n\r\n";
+const char OK_RESPONSE[] = "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok";
+const char EMPTY_RESPONSE[] = "HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n";
 
 auto format_200_header(size_t body_length) {
-  return fmt::format("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+  return fmt::format("HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n",
                      body_length);
 }
+
+constexpr size_t kMaxWriteSize = 256 * 1024;
 
 task<void> send_worker(uringpp::socket &conn, std::list<output_page> &buffer,
                        std::list<output_page> &pending, bool &sending,
@@ -65,10 +68,16 @@ task<void> send_worker(uringpp::socket &conn, std::list<output_page> &buffer,
   while (buffer.size() > 0) {
     iovs.resize(buffer.size());
     size_t i = 0;
+    size_t total_write_size = 0;
     for (auto const &page : buffer) {
       assert(page.size >= page.sent);
+      size_t iov_send_len = page.size - page.sent;
+      if (total_write_size + iov_send_len > kMaxWriteSize) {
+        iov_send_len = kMaxWriteSize - total_write_size;
+      }
+      total_write_size += iov_send_len;
       iovs[i].iov_base = page.data + page.sent;
-      iovs[i].iov_len = page.size - page.sent;
+      iovs[i].iov_len = iov_send_len;
       ++i;
     }
     auto n = co_await conn.writev(&iovs[0], iovs.size());
@@ -648,6 +657,7 @@ task<void> rpc_recv_loop(uringpp::socket &rpc_conn) {
         if (n < 0) {
           fmt::print("recv error: {}\n", strerror(-n));
         }
+        fmt::print("recv loop exit\n");
         co_return;
       }
       response.advance_write(n);
@@ -672,6 +682,11 @@ task<void> rpc_server(std::shared_ptr<uringpp::event_loop> loop,
   while (true) {
     auto [addr, conn] =
         co_await listener.accept(loops[rpc_conn_id % loops.size()]);
+    {
+      int flags = 1;
+      setsockopt(conn.fd(), SOL_TCP, TCP_NODELAY, (void *)&flags,
+                 sizeof(flags));
+    }
     handle_rpc(std::move(conn), rpc_conn_id++).detach();
   }
   co_return;
@@ -1031,6 +1046,11 @@ task<void> http_server(std::shared_ptr<uringpp::event_loop> loop) {
     try {
       auto [addr, conn] =
           co_await listener.accept(loops[conn_id % loops.size()]);
+      {
+        int flags = 1;
+        setsockopt(conn.fd(), SOL_TCP, TCP_NODELAY, (void *)&flags,
+                   sizeof(flags));
+      }
       handle_http(std::move(conn), conn_id).detach();
       conn_id++;
     } catch (std::exception &e) {
@@ -1049,6 +1069,11 @@ task<void> connect_rpc_client(size_t peer_idx, std::string const &host,
     while (true) {
       try {
         auto rpc_conn = co_await uringpp::socket::connect(loop, host, port);
+        {
+          int flags = 1;
+          setsockopt(rpc_conn.fd(), SOL_TCP, TCP_NODELAY, (void *)&flags,
+                     sizeof(flags));
+        }
         auto state = send_conn_state{
             std::make_unique<uringpp::socket>(std::move(rpc_conn)),
             {},
@@ -1068,7 +1093,7 @@ task<void> connect_rpc_client(size_t peer_idx, std::string const &host,
   fmt::print("All connected to peer {}\n", host);
 }
 
-int main() {
+int main(int argc, char *argv[]) {
   auto main_loop = uringpp::event_loop::create();
   ::signal(SIGPIPE, SIG_IGN);
   auto cores = get_cpu_affinity();
@@ -1103,9 +1128,11 @@ int main() {
       main_loop->poll();
     }
   });
-  // connect_rpc_client(0, "28.10.10.75", "58080").detach();
-  // while (clients_connected != cores.size() * 1) {
-  //   std::this_thread::sleep_for(std::chrono::milliseconds(10));
-  // }
+  if (argc > 1) {
+    connect_rpc_client(0, "28.10.10.75", "58080").detach();
+    while (clients_connected != cores.size() * 1) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+  }
   return 0;
 }
