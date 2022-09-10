@@ -119,7 +119,7 @@ void storage::first_time_init() {
 void storage::load_kv() {
   open_kv_db();
   size_t count = 0;
-  fmt::print("Start loading (not first time)");
+  fmt::print("Start loading (not first time)\n");
   auto it = std::unique_ptr<rocksdb::Iterator>(
       kv_db_->NewIterator(get_bulk_read_options()));
   for (it->SeekToFirst(); it->Valid(); it->Next()) {
@@ -129,11 +129,11 @@ void storage::load_kv() {
                    std::string_view(value.data(), value.size()));
     count++;
   }
-  fmt::print("Loaded {} keys from db", count);
+  fmt::print("Loaded {} keys from db\n", count);
 }
 
 void storage::load_zset() {
-  fmt::print("Loading ZSET");
+  fmt::print("Loading ZSET\n");
   auto it = std::unique_ptr<rocksdb::Iterator>(
       zset_db_->NewIterator(get_bulk_read_options()));
   auto count = 0;
@@ -146,7 +146,7 @@ void storage::load_zset() {
                     std::string_view(value.data(), value.size()), score);
     count++;
   }
-  fmt::print("Loaded {} ZSET keys", count);
+  fmt::print("Loaded {} ZSET keys\n", count);
 }
 
 task<void> storage::try_update_peer() {
