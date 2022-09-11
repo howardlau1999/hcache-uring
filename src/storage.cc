@@ -91,24 +91,31 @@ void storage::first_time_init() {
     load_db = std::unique_ptr<rocksdb::DB>(db);
     rocksdb::WriteOptions write_options;
     write_options.disableWAL = true;
+    auto load_threads = std::vector<std::thread>();
     {
       for (auto &&db : init_dbs) {
-        fmt::print("Start loading");
-        size_t count = 0;
-        std::unique_ptr<rocksdb::Iterator> it(
-            db->NewIterator(get_bulk_read_options()));
-        for (it->SeekToFirst(); it->Valid(); it->Next()) {
-          std::string_view key(it->key().data(), it->key().size());
-          std::string_view value(it->value().data(), it->value().size());
-          auto const shard = get_shard(key);
-          if (shard != me_) {
-            continue;
-          }
-          load_db->Put(write_options, it->key(), it->value());
-          add_no_persist(key, value);
-          count++;
-        }
-        fmt::print("Loaded {} keys from db", count);
+        load_threads.emplace_back(
+            [db = std::move(db), &load_db = *load_db, write_options, this]() {
+              fmt::print("Start loading");
+              size_t count = 0;
+              std::unique_ptr<rocksdb::Iterator> it(
+                  db->NewIterator(get_bulk_read_options()));
+              for (it->SeekToFirst(); it->Valid(); it->Next()) {
+                std::string_view key(it->key().data(), it->key().size());
+                std::string_view value(it->value().data(), it->value().size());
+                auto const shard = get_shard(key);
+                if (shard != me) {
+                  continue;
+                }
+                load_db.Put(write_options, it->key(), it->value());
+                add_no_persist(key, value);
+                count++;
+              }
+              fmt::print("Loaded {} keys from db", count);
+            });
+      }
+      for (auto &&t : load_threads) {
+        t.join();
       }
     }
     kv_initialized_ = true;

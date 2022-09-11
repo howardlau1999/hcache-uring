@@ -21,6 +21,9 @@
 #include "rpc.h"
 #include "uringpp/task.h"
 
+size_t get_shard(std::string_view key);
+extern size_t nr_peers;
+extern size_t me;
 
 using uringpp::task;
 
@@ -166,12 +169,6 @@ public:
     }
     return ret;
   }
-
-  uint32_t me() const { return me_; }
-  size_t get_shard(std::string_view key) const {
-    return std::hash<std::string_view>{}(key) % peers_.size();
-  }
-  size_t nr_peer() const { return peers_.size(); }
 
   task<void> try_update_peer();
 

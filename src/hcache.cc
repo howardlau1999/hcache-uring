@@ -1259,6 +1259,7 @@ int main(int argc, char *argv[]) {
   rpc_server(main_loop, "58080").detach();
   auto t = connect_rpc_client("58080");
   while (!t.h_.done()) {
+    main_loop->run_pending();
     main_loop->poll_no_wait();
   }
   http_server(main_loop).detach();
