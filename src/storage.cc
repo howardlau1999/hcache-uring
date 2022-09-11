@@ -22,6 +22,7 @@ static inline rocksdb::Options get_open_options() {
   options.allow_mmap_writes = true;
   options.use_adaptive_mutex = true;
   options.DisableExtraChecks();
+  options.IncreaseParallelism(4);
   return options;
 }
 
@@ -130,6 +131,11 @@ void storage::load_kv() {
     count++;
   }
   fmt::print("Loaded {} keys from db\n", count);
+}
+
+void storage::flush() {
+  kv_db_->Flush(rocksdb::FlushOptions());
+  zset_db_->Flush(rocksdb::FlushOptions());
 }
 
 void storage::load_zset() {

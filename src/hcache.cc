@@ -59,6 +59,8 @@ std::atomic<size_t> loop_started;
 std::atomic<size_t> clients_connected;
 std::unique_ptr<storage> store;
 std::shared_ptr<loop_with_queue> main_loop;
+std::vector<std::string> peer_hosts;
+std::atomic<bool> peers_updated;
 size_t nr_peers = 0;
 size_t me = 0;
 
@@ -649,7 +651,7 @@ task<void> remote_zrmv(send_conn_state &state, std::string_view key,
   co_await rpc_call(state, header_body, kRPCRequestHeaderSize + body_size);
 }
 
-task<void> rpc_recv_loop(uringpp::socket &rpc_conn) {
+task<void> rpc_reply_recv_loop(uringpp::socket &rpc_conn) {
   io_buffer response(65536);
   int state = kStateRecvHeader;
   size_t rep_size = 0;
@@ -667,6 +669,8 @@ task<void> rpc_recv_loop(uringpp::socket &rpc_conn) {
         if (response.writable() < rep_size) {
           response.expand(rep_size - response.writable());
         }
+      } else if (response.writable() < kRPCReplyHeaderSize) {
+        response.expand(kRPCReplyHeaderSize - response.writable());
       }
     }
     if (state == kStateRecvBody) {
@@ -675,6 +679,7 @@ task<void> rpc_recv_loop(uringpp::socket &rpc_conn) {
       }
     }
     if (state != kStateProcess) {
+      assert(response.writable() > 0);
       auto n = co_await rpc_conn.recv(response.write_data(),
                                       response.writable(), MSG_NOSIGNAL);
       if (n <= 0) {
@@ -698,8 +703,7 @@ task<void> rpc_recv_loop(uringpp::socket &rpc_conn) {
   }
 }
 
-task<void> rpc_server(std::shared_ptr<loop_with_queue> loop,
-                      std::string const &port) {
+task<void> rpc_server(std::shared_ptr<loop_with_queue> loop, std::string port) {
   co_await loop->switch_to_io_thread();
   size_t rpc_conn_id = 0;
   auto listener = uringpp::listener::listen(loop, "0.0.0.0", port);
@@ -812,12 +816,16 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
             }
           }
           {
-            auto connect_thread = std::jthread([]() {
-              auto t = connect_rpc_client("58080");
-              while (!t.h_.done()) {
-                std::this_thread::yield();
-              }
-            });
+            bool init = false;
+            if (peers_updated.compare_exchange_strong(init, true)) {
+              auto connect_thread = std::thread([]() {
+                auto t = connect_rpc_client("58080");
+                while (!t.h_.done()) {
+                  std::this_thread::yield();
+                }
+              });
+              connect_thread.detach();
+            }
           }
           if (store->kv_loaded()) {
             send_all(conn, sending, closed, send_buf, pending_send_buf,
@@ -1084,7 +1092,6 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
                   auto sv_object = rapidjson::Value(rapidjson::kObjectType);
                   auto v_string =
                       rapidjson::StringRef(kv.value.data(), kv.value.size());
-                  sv_object["value"].SetString(v_string);
                   sv_object.AddMember("value", v_string, allocator);
                   sv_object.AddMember("score", kv.score, allocator);
                   sv_list.PushBack(sv_object, allocator);
@@ -1141,14 +1148,16 @@ task<void> http_server(std::shared_ptr<loop_with_queue> loop) {
 
 task<void> connect_rpc_client(std::string port) {
   (void)loop_started.load();
+  const size_t num_conns_per_shard = 4;
   try {
     co_await main_loop->switch_to_io_thread();
+    fmt::print("Starting RPC client\n");
     auto f = co_await uringpp::file::open(main_loop, "/data/cluster.json",
                                           O_RDONLY, 0644);
     std::vector<char> buf;
     while (true) {
       std::array<char, 4096> read_buf;
-      auto rc = co_await f.read(&read_buf[0], read_buf.size());
+      auto rc = co_await f.read(&read_buf[0], read_buf.size(), buf.size());
       if (rc <= 0) {
         break;
       }
@@ -1161,17 +1170,21 @@ task<void> connect_rpc_client(std::string port) {
     auto hosts = doc["hosts"].get_array().take_value();
     me = doc["index"].get_uint64().take_value() - 1;
     nr_peers = hosts.size();
+    for (auto &&host : hosts) {
+      peer_hosts.emplace_back(host.get_string().take_value());
+    }
     rpc_clients.resize(hosts.size());
-    for (size_t peer_idx = 0; peer_idx < nr_peers; ++peer_idx) {
-      if (peer_idx == me) {
-        continue;
-      }
-      auto host = hosts.at(peer_idx).get_string().take_value();
-      rpc_clients[peer_idx].resize(loops.size());
-      for (int i = 0; i < loops.size(); i++) {
-        auto loop = loops[i];
-        co_await loop->switch_to_io_thread();
-        const size_t num_conns_per_shard = 1;
+    peers_updated = true;
+    for (int i = 0; i < loops.size(); i++) {
+      auto loop = loops[i];
+      co_await loop->switch_to_io_thread();
+      for (size_t peer_idx = 0; peer_idx < nr_peers; ++peer_idx) {
+        if (peer_idx == me) {
+          continue;
+        }
+        auto const &host = peer_hosts[peer_idx];
+        fmt::print("Connecting to {}:{}\n", host, port);
+        rpc_clients[peer_idx].resize(loops.size());
         rpc_clients[peer_idx][i].conns.resize(num_conns_per_shard);
         for (int c = 0; c < num_conns_per_shard; c++) {
           while (true) {
@@ -1190,7 +1203,8 @@ task<void> connect_rpc_client(std::string port) {
                   false,
                   false};
               rpc_clients[peer_idx][i].conns[c] = std::move(state);
-              rpc_recv_loop(*rpc_clients[peer_idx][i].conns[c].conn).detach();
+              rpc_reply_recv_loop(*rpc_clients[peer_idx][i].conns[c].conn)
+                  .detach();
               fmt::print("Connected to peer {} on loop {}\n", host, i);
               break;
             } catch (...) {
@@ -1208,6 +1222,7 @@ task<void> connect_rpc_client(std::string port) {
 
 int main(int argc, char *argv[]) {
   main_loop = loop_with_queue::create();
+  main_loop->waker().detach();
   ::signal(SIGPIPE, SIG_IGN);
   auto cores = get_cpu_affinity();
   loops.resize(cores.size());
@@ -1216,6 +1231,12 @@ int main(int argc, char *argv[]) {
     auto kv_thread = std::jthread([]() { store->load_kv(); });
     auto zset_thread = std::jthread([]() { store->load_zset(); });
   }
+  auto flush_thread = std::thread([core = cores[0]]() {
+    bind_cpu(core);
+    store->flush();
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+  });
+  flush_thread.detach();
   bind_cpu(cores[0]);
   for (int i = 0; i < cores.size(); ++i) {
     auto thread = std::thread([i, core = cores[i]] {
@@ -1236,15 +1257,13 @@ int main(int argc, char *argv[]) {
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
   rpc_server(main_loop, "58080").detach();
-  std::jthread main_poll_thread([]() {
-    for (;;) {
-      main_loop->poll();
-    }
-  });
   auto t = connect_rpc_client("58080");
   while (!t.h_.done()) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    main_loop->poll_no_wait();
   }
   http_server(main_loop).detach();
+  for (;;) {
+    main_loop->poll();
+  }
   return 0;
 }
