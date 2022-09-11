@@ -55,12 +55,12 @@ struct conn_pool {
 
 std::vector<std::shared_ptr<loop_with_queue>> loops;
 std::vector<std::vector<conn_pool>> rpc_clients;
-std::atomic<size_t> loop_started;
-std::atomic<size_t> clients_connected;
+std::atomic<size_t> loop_started = 0;
+std::atomic<size_t> clients_connected = 0;
 std::unique_ptr<storage> store;
 std::shared_ptr<loop_with_queue> main_loop;
 std::vector<std::string> peer_hosts;
-std::atomic<bool> peers_updated;
+std::atomic<bool> peers_updated = false;
 size_t nr_peers = 0;
 size_t me = 0;
 
