@@ -809,22 +809,19 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
           // init
           {
             bool init = false;
-            if (store->kv_initializing_.compare_exchange_strong(init, true)) {
-              auto init_thread =
-                  std::thread([]() { store->first_time_init(); });
-              init_thread.detach();
-            }
-          }
-          {
-            bool init = false;
             if (peers_updated.compare_exchange_strong(init, true)) {
-              auto connect_thread = std::thread([]() {
+              auto connect_init_thread = std::thread([]() {
                 auto t = connect_rpc_client("58080");
                 while (!t.h_.done()) {
                   std::this_thread::yield();
                 }
+                bool init = false;
+                if (store->kv_initializing_.compare_exchange_strong(init,
+                                                                    true)) {
+                  store->first_time_init();
+                }
               });
-              connect_thread.detach();
+              connect_init_thread.detach();
             }
           }
           if (store->kv_loaded()) {

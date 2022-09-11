@@ -124,10 +124,8 @@ typedef cuckoo_set<key_value_intl> kv_cuckoo_set;
 typedef cuckoo_set<zset_intl> zset_cuckoo_set;
 
 class storage {
-  std::vector<char> peers_;
   std::unique_ptr<rocksdb::DB> kv_db_;
   std::unique_ptr<rocksdb::DB> zset_db_;
-  std::atomic<uint32_t> me_;
   std::atomic<bool> kv_initialized_;
 
   kv_cuckoo_set kvs_;
