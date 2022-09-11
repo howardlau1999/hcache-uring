@@ -1,6 +1,5 @@
 #include "io_buffer.h"
 #include "rpc.h"
-#include "simdjson/padded_string.h"
 #include "storage.h"
 #include "threading.h"
 #include <algorithm>
@@ -750,6 +749,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
     std::list<output_page> send_buf;
     std::list<output_page> pending_send_buf;
     phr_header headers[16];
+    simdjson::dom::parser parser;
     while (true) {
       // Receiving Header
       if (parser_rc == -2) {
@@ -804,7 +804,10 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
       switch (method[0]) {
       case 'G': {
         switch (path[1]) {
-        default:
+        default: {
+          send_all(conn, sending, closed, send_buf, pending_send_buf,
+                     OK_RESPONSE, sizeof(OK_RESPONSE) - 1);
+        } break;
         case 'i': {
           // init
           {
@@ -815,13 +818,18 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
                 while (!t.h_.done()) {
                   std::this_thread::yield();
                 }
-                bool init = false;
-                if (store->kv_initializing_.compare_exchange_strong(init,
-                                                                    true)) {
-                  store->first_time_init();
-                }
               });
               connect_init_thread.detach();
+            }
+          }
+          {
+            bool init = false;
+            if (store->kv_initializing_.compare_exchange_strong(init,
+                                                                true)) {
+              auto init_thread= std::thread([] () {
+                  store->first_time_init();
+              });
+              init_thread.detach();
             }
           }
           if (store->kv_loaded()) {
@@ -903,6 +911,11 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
         } break;
         case 'u': {
           // updateCluster
+          std::string_view clusterjson(body_start, body_received);
+          simdjson::padded_string padded(clusterjson);
+          auto doc = parser.parse(padded);
+          nr_peers = doc["hosts"].get_array().size();
+          me = doc["index"].get_uint64() - 1;
           auto f = co_await uringpp::file::open(loop, "/data/cluster.json",
                                                 O_CREAT | O_RDWR, 0644);
           co_await f.write(body_start, content_length, 0);
@@ -912,7 +925,6 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
         } break;
         case 'a': {
           // add
-          simdjson::dom::parser parser;
           simdjson::padded_string json =
               simdjson::padded_string(body_start, content_length);
           auto doc = parser.parse(json);
@@ -930,7 +942,6 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
         } break;
         case 'b': {
           // batch
-          simdjson::dom::parser parser;
           simdjson::padded_string json =
               simdjson::padded_string(body_start, content_length);
           auto doc = parser.parse(json);
@@ -963,7 +974,6 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
         } break;
         case 'l': {
           // list
-          simdjson::dom::parser parser;
           simdjson::padded_string json =
               simdjson::padded_string(body_start, content_length);
           auto doc = parser.parse(json);
@@ -1038,7 +1048,6 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
           case 'a': {
             // zadd
             std::string_view key(&path[6], path_len - 6);
-            simdjson::dom::parser parser;
             simdjson::padded_string json =
                 simdjson::padded_string(body_start, content_length);
             auto score_value = parser.parse(json);
@@ -1058,7 +1067,6 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
           case 'r': {
             // zrange
             std::string_view key(&path[8], path_len - 8);
-            simdjson::dom::parser parser;
             simdjson::padded_string json =
                 simdjson::padded_string(body_start, content_length);
             auto score_range = parser.parse(json);
