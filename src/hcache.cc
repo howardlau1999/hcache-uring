@@ -993,7 +993,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
           }
           auto local_key_values = store->list(keys.begin(), keys.end());
           auto remote_kv_count = 0;
-          std::vector<task<std::vector<key_value>>> tasks;
+          std::vector<task<std::vector<key_view_value>>> tasks;
           for (auto key_shard = 0; key_shard < nr_peers; ++key_shard) {
             if (key_shard == me) {
               continue;

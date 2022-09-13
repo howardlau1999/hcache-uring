@@ -215,9 +215,9 @@ public:
     return ret;
   }
 
-  std::vector<key_value> list(std::vector<std::string_view>::iterator begin,
+  std::vector<key_view_value> list(std::vector<std::string_view>::iterator begin,
                               std::vector<std::string_view>::iterator end) {
-    std::vector<key_value> ret;
+    std::vector<key_view_value> ret;
     for (auto it = begin; it != end; ++it) {
       if (auto v = query(*it); v.first) {
         ret.emplace_back(std::move(*it), std::string(v.first, v.second));
