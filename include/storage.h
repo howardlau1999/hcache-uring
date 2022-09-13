@@ -1,25 +1,77 @@
 #pragma once
 
-#include <cds/intrusive/options.h>
-#include <cds/opt/compare.h>
-#include <cds/opt/options.h>
-#include <rocksdb/slice.h>
+#include "rpc.h"
+#include "uringpp/task.h"
 #include <algorithm>
+#include <boost/multi_index/hashed_index.hpp>
+#include <boost/multi_index/member.hpp>
+#include <boost/multi_index_container.hpp>
 #include <cds/intrusive/cuckoo_set.h>
 #include <cds/intrusive/michael_list_hp.h>
 #include <cds/intrusive/michael_set.h>
+#include <cds/intrusive/options.h>
+#include <cds/opt/compare.h>
+#include <cds/opt/options.h>
 #include <cstddef>
 #include <cstdint>
 #include <map>
 #include <optional>
 #include <rocksdb/db.h>
+#include <rocksdb/slice.h>
 #include <shared_mutex>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
-#include "rpc.h"
-#include "uringpp/task.h"
+
+using namespace boost::multi_index;
+
+template <typename T, typename Q> struct mutable_pair {
+  T first;
+  mutable Q second;
+};
+
+struct index_string {
+  std::string key;
+};
+
+struct string_view_hash {
+  std::size_t operator()(const std::string_view &v) const {
+    return boost::hash_range(v.begin(), v.end());
+  }
+  std::size_t operator()(const std::string &s) const {
+    return boost::hash_range(s.begin(), s.end());
+  }
+};
+
+struct string_view_equal_to {
+  std::size_t operator()(const std::string &s1, const std::string &s2) const {
+    return s1 == s2;
+  }
+  std::size_t operator()(const std::string &s1,
+                         const std::string_view &v2) const {
+    return s1.size() == v2.size() &&
+           std::equal(s1.begin(), s1.end(), v2.begin());
+  }
+  std::size_t operator()(const std::string_view &v1,
+                         const std::string &s2) const {
+    return v1.size() == s2.size() &&
+           std::equal(v1.begin(), v1.end(), s2.begin());
+  }
+};
+
+template <typename Q>
+using unordered_string_map = multi_index_container<
+    mutable_pair<std::string, Q>,
+    indexed_by<hashed_unique<member<mutable_pair<std::string, Q>, std::string,
+                                    &mutable_pair<std::string, Q>::first>,
+                             string_view_hash, string_view_equal_to>>>;
+
+using unordered_string_set = multi_index_container<
+    index_string, indexed_by<hashed_unique<
+                      member<index_string, std::string, &index_string::key>,
+                      string_view_hash, string_view_equal_to>>>;
 
 size_t get_shard(std::string_view key);
 extern size_t nr_peers;
@@ -35,14 +87,18 @@ struct key_value_intl
       : key(k.data(), k.size()), value(v.data(), v.size()) {}
 };
 
-struct zset_intl
-    : public cds::intrusive::cuckoo::node<cds::intrusive::cuckoo::list, 2> {
-  std::string key;
-  zset_intl(std::string_view k) : key(k) {}
-  std::map<uint32_t, std::unordered_set<std::string>> score_values;
-  std::unordered_map<std::string, uint32_t> value_score;
+struct zset_stl {
+  std::map<uint32_t, unordered_string_set> score_values;
+  unordered_string_map<uint32_t> value_score;
   std::shared_mutex mutex;
   void zadd(uint32_t score, std::string_view value);
+};
+
+struct zset_intl
+    : public cds::intrusive::cuckoo::node<cds::intrusive::cuckoo::list, 2>,
+      public zset_stl {
+  std::string key;
+  zset_intl(std::string_view k) : key(k) {}
 };
 
 template <typename T> struct mi_disposer {
@@ -124,12 +180,15 @@ typedef cuckoo_set<key_value_intl> kv_cuckoo_set;
 typedef cuckoo_set<zset_intl> zset_cuckoo_set;
 
 class storage {
+  static constexpr size_t nr_shards = 64;
   std::unique_ptr<rocksdb::DB> kv_db_;
   std::unique_ptr<rocksdb::DB> zset_db_;
   std::atomic<bool> kv_initialized_;
 
-  kv_cuckoo_set kvs_;
-  zset_cuckoo_set zsets_;
+  unordered_string_map<std::string> kvs_[nr_shards];
+  std::shared_mutex kvs_mutex_[nr_shards];
+  unordered_string_map<std::unique_ptr<zset_stl>> zsets_[nr_shards];
+  std::shared_mutex zsets_mutex_[nr_shards];
 
   void open_kv_db();
 
@@ -156,9 +215,8 @@ public:
     return ret;
   }
 
-  std::vector<key_value>
-  list(std::vector<std::string_view>::iterator begin,
-       std::vector<std::string_view>::iterator end) {
+  std::vector<key_value> list(std::vector<std::string_view>::iterator begin,
+                              std::vector<std::string_view>::iterator end) {
     std::vector<key_value> ret;
     for (auto it = begin; it != end; ++it) {
       if (auto v = query(*it); v.first) {
@@ -170,20 +228,19 @@ public:
 
   task<void> try_update_peer();
 
-  std::pair<char*, size_t> query(std::string_view key);
-  task<std::optional<std::string>>
-  remote_query(size_t shard, std::string_view key);
+  std::pair<char *, size_t> query(std::string_view key);
+  task<std::optional<std::string>> remote_query(size_t shard,
+                                                std::string_view key);
 
   task<std::vector<key_value>>
   remote_list(size_t shard, std::unordered_set<std::string_view> &&keys);
 
-  task<void> remote_batch(size_t shared,
-                                     std::vector<key_value_view> &&kvs);
+  task<void> remote_batch(size_t shared, std::vector<key_value_view> &&kvs);
 
   void add_no_persist(std::string_view key, std::string_view value);
   void add(std::string_view key, std::string_view value);
   task<void> remote_add(size_t shard, std::string_view key,
-                                   std::string_view value);
+                        std::string_view value);
 
   void del(std::string_view key);
   task<void> remote_del(size_t shard, std::string_view key);
@@ -192,11 +249,11 @@ public:
                        uint32_t score);
   void zadd(std::string_view key, std::string_view value, uint32_t score);
   task<void> remote_zadd(size_t shard, std::string_view key,
-                                    std::string_view value, uint32_t score);
+                         std::string_view value, uint32_t score);
 
   void zrmv(std::string_view key, std::string_view value);
   task<void> remote_zrmv(size_t shard, std::string_view key,
-                                    std::string_view value);
+                         std::string_view value);
 
   std::optional<std::vector<score_value>>
   zrange(std::string_view key, uint32_t min_score, uint32_t max_score);

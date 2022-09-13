@@ -9,6 +9,7 @@
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string_view>
 #include <vector>
 
@@ -189,32 +190,47 @@ task<void> storage::try_update_peer() {
 std::pair<char *, size_t> storage::query(std::string_view key) {
   size_t ret_size = 0;
   char *ret_value = nullptr;
-  if (!cds::threading::Manager::isThreadAttached()) {
-    cds::threading::Manager::attachThread();
+  // if (!cds::threading::Manager::isThreadAttached()) {
+  //   cds::threading::Manager::attachThread();
+  // }
+  // kvs_.find(key, [&](auto &kv, ...) {
+  //   ret_value = new char[kv.value.size()];
+  //   ret_size = kv.value.size();
+  //   std::copy_n(kv.value.data(), kv.value.size(), ret_value);
+  // });
+  auto shard = std::hash<std::string_view>()(key) % nr_shards;
+  {
+    std::shared_lock lock(kvs_mutex_[shard]);
+    auto it = kvs_[shard].find(key);
+    if (it != kvs_[shard].end()) {
+      ret_value = new char[it->second.size()];
+      ret_size = it->second.size();
+      std::copy_n(it->second.data(), it->second.size(), ret_value);
+    }
   }
-  kvs_.find(key, [&](auto &kv, ...) {
-    ret_value = new char[kv.value.size()];
-    ret_size = kv.value.size();
-    std::copy_n(kv.value.data(), kv.value.size(), ret_value);
-  });
   return {ret_value, ret_size};
 }
 
 void storage::add_no_persist(std::string_view key, std::string_view value) {
-  if (!cds::threading::Manager::isThreadAttached()) {
-    cds::threading::Manager::attachThread();
+  // if (!cds::threading::Manager::isThreadAttached()) {
+  //   cds::threading::Manager::attachThread();
+  // }
+  // if (kvs_.find(key,
+  //               [value](auto &kv, ...) { kv.value = std::string(value); })) {
+  //   return;
+  // }
+  // key_value_intl *kv = new key_value_intl(key, value);
+  // kvs_.update(*kv, [](bool inserted, auto &old_kv, auto &new_kv) {
+  //   if (!inserted) {
+  //     old_kv.value = new_kv.value;
+  //     mi_disposer<key_value_intl>()(&new_kv);
+  //   }
+  // });
+  {
+    auto shard = std::hash<std::string_view>()(key) % nr_shards;
+    std::unique_lock lock(kvs_mutex_[shard]);
+    kvs_[shard].insert({std::string(key), std::string(value)});
   }
-  if (kvs_.find(key,
-                [value](auto &kv, ...) { kv.value = std::string(value); })) {
-    return;
-  }
-  key_value_intl *kv = new key_value_intl(key, value);
-  kvs_.update(*kv, [](bool inserted, auto &old_kv, auto &new_kv) {
-    if (!inserted) {
-      old_kv.value = new_kv.value;
-      mi_disposer<key_value_intl>()(&new_kv);
-    }
-  });
 }
 
 static inline rocksdb::WriteOptions get_write_options() {
@@ -229,53 +245,78 @@ void storage::add(std::string_view key, std::string_view value) {
 }
 
 void storage::del(std::string_view key) {
-  if (!cds::threading::Manager::isThreadAttached()) {
-    cds::threading::Manager::attachThread();
+  // if (!cds::threading::Manager::isThreadAttached()) {
+  //   cds::threading::Manager::attachThread();
+  // }
+  auto shard = std::hash<std::string_view>()(key) % nr_shards;
+  {
+    std::unique_lock lock(kvs_mutex_[shard]);
+    auto it = kvs_[shard].find(key);
+    if (it != kvs_[shard].end()) {
+      kvs_[shard].erase(it);
+    }
   }
-  kvs_.erase(key);
-  zsets_.erase(key);
+  {
+    std::unique_lock lock(zsets_mutex_[shard]);
+    auto it = zsets_[shard].find(key);
+    if (it != zsets_[shard].end()) {
+      zsets_[shard].erase(it);
+    }
+  }
   kv_db_->Delete(get_write_options(), key);
 }
 
-void zset_intl::zadd(uint32_t score, std::string_view value) {
-  if (!cds::threading::Manager::isThreadAttached()) {
-    cds::threading::Manager::attachThread();
-  }
-  std::string value_copy(value);
+void zset_stl::zadd(uint32_t score, std::string_view value) {
+  // if (!cds::threading::Manager::isThreadAttached()) {
+  //   cds::threading::Manager::attachThread();
+  // }
   std::lock_guard lock(mutex);
-  if (auto it = value_score.find(value_copy); it != value_score.end()) {
+  if (auto it = value_score.find(value); it != value_score.end()) {
     auto old_score = it->second;
     if (old_score != score) {
-      score_values[old_score].erase(value_copy);
-      score_values[score].emplace(std::move(value_copy));
+      auto &old_values = score_values[old_score];
+      old_values.erase(old_values.find(value));
+      score_values[score].emplace(std::string(value));
       it->second = score;
     }
   } else {
-    value_score.emplace(value_copy, score);
-    score_values[score].emplace(std::move(value_copy));
+    value_score.insert({std::string(value), score});
+    score_values[score].emplace(std::string(value));
   }
 }
 
 void storage::zadd_no_persist(std::string_view key, std::string_view value,
                               uint32_t score) {
-  if (!cds::threading::Manager::isThreadAttached()) {
-    cds::threading::Manager::attachThread();
-  }
-  if (zsets_.find(key, [value, score](zset_intl &zset, ...) {
-        zset.zadd(score, value);
-      })) {
-    return;
-  }
-  zset_intl *zset = new zset_intl(key);
-  zsets_.update(*zset, [value, score](bool inserted, zset_intl &old_zset,
-                                      zset_intl &new_zset) {
-    if (!inserted) {
-      old_zset.zadd(score, value);
-      mi_disposer<zset_intl>()(&new_zset);
+  // if (!cds::threading::Manager::isThreadAttached()) {
+  //   cds::threading::Manager::attachThread();
+  // }
+  // if (zsets_.find(key, [value, score](zset_intl &zset, ...) {
+  //       zset.zadd(score, value);
+  //     })) {
+  //   return;
+  // }
+  // zset_intl *zset = new zset_intl(key);
+  // zsets_.update(*zset, [value, score](bool inserted, zset_intl &old_zset,
+  //                                     zset_intl &new_zset) {
+  //   if (!inserted) {
+  //     old_zset.zadd(score, value);
+  //     mi_disposer<zset_intl>()(&new_zset);
+  //   } else {
+  //     new_zset.zadd(score, value);
+  //   }
+  // });
+  auto shard = std::hash<std::string_view>()(key) % nr_shards;
+  {
+    std::unique_lock lock(zsets_mutex_[shard]);
+    auto it = zsets_[shard].find(key);
+    if (it != zsets_[shard].end()) {
+      it->second->zadd(score, value);
     } else {
-      new_zset.zadd(score, value);
+      auto zset = std::make_unique<zset_stl>();
+      zset->zadd(score, value);
+      zsets_[shard].insert({std::string(key), std::move(zset)});
     }
-  });
+  }
 }
 
 void storage::zadd(std::string_view key, std::string_view value,
@@ -286,41 +327,70 @@ void storage::zadd(std::string_view key, std::string_view value,
       get_write_options(), rocksdb::Slice(full_key.data(), full_key.size()),
       rocksdb::Slice(reinterpret_cast<const char *>(&score), sizeof(score)));
 }
+
 void storage::zrmv(std::string_view key, std::string_view value) {
-  if (!cds::threading::Manager::isThreadAttached()) {
-    cds::threading::Manager::attachThread();
-  }
-  auto full_key = encode_zset_key(key, value);
-  zset_db_->Delete(get_write_options(),
-                   rocksdb::Slice(full_key.data(), full_key.size()));
-  zsets_.find(key, [value](zset_intl &zset, ...) {
-    std::string value_copy(value);
-    std::lock_guard lock(zset.mutex);
-    if (auto it = zset.value_score.find(value_copy);
-        it != zset.value_score.end()) {
-      auto score = it->second;
-      zset.score_values[score].erase(value_copy);
-      zset.value_score.erase(it);
+  // if (!cds::threading::Manager::isThreadAttached()) {
+  //   cds::threading::Manager::attachThread();
+  // }
+  // auto full_key = encode_zset_key(key, value);
+  // zset_db_->Delete(get_write_options(),
+  //                  rocksdb::Slice(full_key.data(), full_key.size()));
+  // zsets_.find(key, [value](zset_intl &zset, ...) {
+  //   std::lock_guard lock(zset.mutex);
+  //   if (auto it = zset.value_score.find(value);
+  //       it != zset.value_score.end()) {
+  //     auto score = it->second;
+  //     zset.value_score.erase(it);
+  //   }
+  // });
+  auto shard = std::hash<std::string_view>()(key) % nr_shards;
+  {
+    std::unique_lock lock(zsets_mutex_[shard]);
+    auto it = zsets_[shard].find(key);
+    if (it != zsets_[shard].end()) {
+      auto score_it = it->second->value_score.find(value);
+      if (score_it != it->second->value_score.end()) {
+        auto score = score_it->second;
+        it->second->value_score.erase(score_it);
+        auto &values = it->second->score_values[score];
+        values.erase(values.find(value));
+      }
     }
-  });
+  }
 }
 
 std::optional<std::vector<score_value>>
 storage::zrange(std::string_view key, uint32_t min_score, uint32_t max_score) {
-  if (!cds::threading::Manager::isThreadAttached()) {
-    cds::threading::Manager::attachThread();
-  }
+  // if (!cds::threading::Manager::isThreadAttached()) {
+  //   cds::threading::Manager::attachThread();
+  // }
   std::vector<score_value> ret;
-  if (!zsets_.find(key, [min_score, max_score, &ret](zset_intl &zset, ...) {
-        std::lock_guard lock(zset.mutex);
-        for (auto it = zset.score_values.lower_bound(min_score);
-             it != zset.score_values.end() && it->first <= max_score; it++) {
-          for (auto &&value : it->second) {
-            ret.emplace_back(score_value{value, it->first});
-          }
+  // if (!zsets_.find(key, [min_score, max_score, &ret](zset_intl &zset, ...) {
+  //       std::lock_guard lock(zset.mutex);
+  //       for (auto it = zset.score_values.lower_bound(min_score);
+  //            it != zset.score_values.end() && it->first <= max_score; it++) {
+  //         for (auto &&value : it->second) {
+  //           ret.emplace_back(score_value{value, it->first});
+  //         }
+  //       }
+  //     })) {
+  //   return std::nullopt;
+  // }
+  auto shard = std::hash<std::string_view>()(key) % nr_shards;
+  {
+    std::shared_lock lock(zsets_mutex_[shard]);
+    auto zset_it = zsets_[shard].find(key);
+    if (zset_it != zsets_[shard].end()) {
+      for (auto it = zset_it->second->score_values.lower_bound(min_score);
+           it != zset_it->second->score_values.end() && it->first <= max_score;
+           it++) {
+        for (auto &&value : it->second) {
+          ret.emplace_back(score_value{value.key, it->first});
         }
-      })) {
-    return std::nullopt;
+      }
+    } else {
+      return std::nullopt;
+    }
   }
   return ret;
 }
