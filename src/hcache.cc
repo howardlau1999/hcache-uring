@@ -1236,10 +1236,11 @@ int main(int argc, char *argv[]) {
     auto kv_thread = std::jthread([]() { store->load_kv(); });
     auto zset_thread = std::jthread([]() { store->load_zset(); });
   }
-  auto flush_thread = std::thread([core = cores[0]]() {
-    bind_cpu(core);
-    store->flush();
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+  auto flush_thread = std::thread([]() {
+    for (;;) {
+      store->flush();
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
   });
   flush_thread.detach();
   bind_cpu(cores[0]);
