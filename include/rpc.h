@@ -49,3 +49,8 @@ struct score_value {
   std::string value;
   uint32_t score;
 };
+
+struct score_value_view {
+  std::string_view value;
+  uint32_t score;
+};
