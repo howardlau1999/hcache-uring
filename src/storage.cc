@@ -108,7 +108,7 @@ void storage::first_time_init() {
   for (auto &sst : ssts) {
     arg.external_files.push_back(sst.string());
   }
-  kv_db_->IngestExternalFiles({arg});
+  kv_db_->IngestExternalFile(arg.external_files, arg.options);
   kv_initialized_ = true;
 }
 
