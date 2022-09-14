@@ -332,9 +332,9 @@ void storage::zrmv(std::string_view key, std::string_view value) {
   // if (!cds::threading::Manager::isThreadAttached()) {
   //   cds::threading::Manager::attachThread();
   // }
-  // auto full_key = encode_zset_key(key, value);
-  // zset_db_->Delete(get_write_options(),
-  //                  rocksdb::Slice(full_key.data(), full_key.size()));
+  auto full_key = encode_zset_key(key, value);
+  zset_db_->Delete(get_write_options(),
+                   rocksdb::Slice(full_key.data(), full_key.size()));
   // zsets_.find(key, [value](zset_intl &zset, ...) {
   //   std::lock_guard lock(zset.mutex);
   //   if (auto it = zset.value_score.find(value);
