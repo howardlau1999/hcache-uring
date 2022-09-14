@@ -77,7 +77,6 @@ void storage::first_time_init() {
     init_dbs.emplace_back(db);
   }
   {
-    rocksdb::DB *db;
     rocksdb::WriteOptions write_options;
     write_options.disableWAL = true;
     auto load_threads = std::vector<std::thread>();
