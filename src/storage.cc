@@ -80,8 +80,9 @@ void storage::first_time_init() {
       if (!status.ok()) {
         continue;
       }
-      threads.emplace_back([load_db, dir, i, &sst_m, &ssts, this] () {
-        rocksdb::SstFileWriter sst_file_writer(rocksdb::EnvOptions(), get_open_options());
+      threads.emplace_back([load_db, dir, i, &sst_m, &ssts, this]() {
+        rocksdb::SstFileWriter sst_file_writer(rocksdb::EnvOptions(),
+                                               get_open_options());
         auto sst_path = std::filesystem::path(dir) / "bulkload.sst";
         auto status = sst_file_writer.Open(sst_path);
         if (!status.ok()) {
@@ -124,8 +125,7 @@ void storage::load_kv() {
   for (it->SeekToFirst(); it->Valid(); it->Next()) {
     auto key = it->key();
     auto value = it->value();
-    add_no_persist(std::string_view(key.data(), key.size()),
-                   std::string_view(value.data(), value.size()));
+    add_no_persist(key.ToStringView(), value.ToStringView());
     count++;
   }
   fmt::print("Loaded {} keys from db\n", count);
@@ -150,8 +150,7 @@ void storage::load_zset() {
     auto score_raw = it->value();
     auto score = *reinterpret_cast<uint32_t const *>(score_raw.data());
     auto [key, value] = decode_zset_key(full_key);
-    zadd_no_persist(std::string_view(key.data(), key.size()),
-                    std::string_view(value.data(), value.size()), score);
+    zadd_no_persist(key, value, score);
     count++;
   }
   fmt::print("Loaded {} ZSET keys\n", count);
