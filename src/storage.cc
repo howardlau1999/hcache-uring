@@ -142,8 +142,12 @@ void storage::load_kv() {
 }
 
 void storage::flush() {
-  kv_db_->Flush(rocksdb::FlushOptions());
-  zset_db_->Flush(rocksdb::FlushOptions());
+  if (kv_db_) {
+    kv_db_->Flush(rocksdb::FlushOptions());
+  }
+  if (zset_db_) {
+    zset_db_->Flush(rocksdb::FlushOptions());
+  }
 }
 
 void storage::load_zset() {
