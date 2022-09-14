@@ -64,6 +64,7 @@ size_t nr_peers = 0;
 size_t me = 0;
 
 size_t get_shard(std::string_view key) {
+  if (nr_peers == 0) return 0;
   auto hash = std::hash<std::string_view>{}(key);
   return hash % nr_peers;
 }
@@ -993,7 +994,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
           }
           auto local_key_values = store->list(keys.begin(), keys.end());
           auto remote_kv_count = 0;
-          std::vector<task<std::vector<key_view_value>>> tasks;
+          std::vector<task<std::vector<key_value>>> tasks;
           for (auto key_shard = 0; key_shard < nr_peers; ++key_shard) {
             if (key_shard == me) {
               continue;
@@ -1195,7 +1196,7 @@ task<void> connect_rpc_client(std::string port) {
           while (true) {
             try {
               auto rpc_conn = co_await uringpp::socket::connect(
-                  loop, std::string(host), port);
+                  loop, host, port);
               {
                 int flags = 1;
                 setsockopt(rpc_conn.fd(), SOL_TCP, TCP_NODELAY, (void *)&flags,
