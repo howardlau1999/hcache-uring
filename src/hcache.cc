@@ -60,6 +60,7 @@ std::unique_ptr<storage> store;
 std::shared_ptr<loop_with_queue> main_loop;
 std::vector<std::string> peer_hosts;
 std::atomic<bool> peers_updated = false;
+std::atomic<bool> rpc_connected = false;
 size_t nr_peers = 0;
 size_t me = 0;
 
@@ -836,7 +837,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
               init_thread.detach();
             }
           }
-          if (store->kv_loaded()) {
+          if (store->kv_loaded() && rpc_connected) {
             send_all(conn, sending, closed, send_buf, pending_send_buf,
                      OK_RESPONSE, sizeof(OK_RESPONSE) - 1);
           } else {
@@ -1233,6 +1234,7 @@ task<void> connect_rpc_client(std::string port) {
         }
       }
     }
+    rpc_connected = true;
   } catch (std::exception &e) {
     fmt::print("Failed to connect to peers {}\n", e.what());
     co_return;
