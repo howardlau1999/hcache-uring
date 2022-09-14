@@ -34,6 +34,19 @@ std::vector<int> get_cpu_affinity() {
   return cores;
 }
 
+void enable_on_cores(std::vector<int> const& cores) {
+  cpu_set_t cpuset;
+  CPU_ZERO(&cpuset);
+  for (auto core : cores) {
+    CPU_SET(core, &cpuset);
+  }
+  if (auto rc =
+          ::pthread_setaffinity_np(::pthread_self(), sizeof(cpuset), &cpuset);
+      rc != 0) {
+    fmt::print("failed to set affinity {}\n", ::strerror(errno));
+  }
+}
+
 void bind_cpu(int core) {
   cpu_set_t cpuset;
 

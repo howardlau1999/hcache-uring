@@ -11,6 +11,8 @@ void bind_cpu(int core);
 
 std::vector<int> get_cpu_affinity();
 
+void enable_on_cores(std::vector<int> const& cores) ;
+
 class io_queue {
   boost::lockfree::queue<std::coroutine_handle<>,
                          boost::lockfree::capacity<128>>

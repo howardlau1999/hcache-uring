@@ -62,6 +62,7 @@ std::shared_ptr<loop_with_queue> main_loop;
 std::vector<std::string> peer_hosts;
 std::atomic<bool> peers_updated = false;
 std::atomic<bool> rpc_connected = false;
+std::vector<int> cores;
 size_t nr_peers = 0;
 size_t me = 0;
 
@@ -819,6 +820,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
             bool init = false;
             if (peers_updated.compare_exchange_strong(init, true)) {
               auto connect_init_thread = std::thread([]() {
+                enable_on_cores(cores);
                 auto t = connect_rpc_client("58080");
                 while (!t.h_.done()) {
                   std::this_thread::yield();
@@ -831,6 +833,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
             bool init = false;
             if (store->kv_initializing_.compare_exchange_strong(init, true)) {
               auto init_thread = std::thread([]() {
+                enable_on_cores(cores);
                 while (nr_peers == 0) {
                   std::this_thread::yield();
                 }
@@ -1251,7 +1254,7 @@ int main(int argc, char *argv[]) {
   main_loop = loop_with_queue::create();
   main_loop->waker().detach();
   ::signal(SIGPIPE, SIG_IGN);
-  auto cores = get_cpu_affinity();
+  cores = get_cpu_affinity();
   loops.resize(cores.size());
   store = std::make_unique<storage>();
   {
