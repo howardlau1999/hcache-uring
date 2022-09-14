@@ -77,26 +77,14 @@ void storage::first_time_init() {
     init_dbs.emplace_back(db);
   }
   {
-    rocksdb::Options load_db_options;
-    load_db_options.create_if_missing = true;
-    load_db_options.allow_mmap_writes = true;
-    load_db_options.DisableExtraChecks();
-    load_db_options.PrepareForBulkLoad();
     rocksdb::DB *db;
-    std::unique_ptr<rocksdb::DB> load_db;
-    kv_db_ = nullptr;
-    auto status = rocksdb::DB::Open(load_db_options, kv_dir, &db);
-    if (!status.ok()) {
-      throw std::runtime_error(status.ToString());
-    }
-    load_db = std::unique_ptr<rocksdb::DB>(db);
     rocksdb::WriteOptions write_options;
     write_options.disableWAL = true;
     auto load_threads = std::vector<std::thread>();
     {
       for (auto &&db : init_dbs) {
         load_threads.emplace_back(
-            [db = std::move(db), &load_db = *load_db, write_options, this]() {
+            [db = std::move(db), &load_db = *kv_db_, write_options, this]() {
               fmt::print("Start loading");
               size_t count = 0;
               std::unique_ptr<rocksdb::Iterator> it(
@@ -120,7 +108,6 @@ void storage::first_time_init() {
       }
     }
     kv_initialized_ = true;
-    load_db->CompactRange(rocksdb::CompactRangeOptions{}, nullptr, nullptr);
   }
   open_kv_db();
 }
