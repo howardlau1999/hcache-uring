@@ -1,4 +1,5 @@
 #include "storage.h"
+#include "rocksdb/db.h"
 
 #include <boost/algorithm/string/classification.hpp>
 #include <boost/algorithm/string/split.hpp>
@@ -66,48 +67,25 @@ void storage::first_time_init() {
   }
   std::vector<std::string> init_dirs;
   boost::split(init_dirs, init_dirs_env, boost::is_any_of(","));
-  std::vector<std::unique_ptr<rocksdb::DB>> init_dbs;
+  std::vector<std::filesystem::path> ssts;
   rocksdb::Options options = get_open_options();
   for (auto dir : init_dirs) {
-    rocksdb::DB *db;
-    auto status = rocksdb::DB::Open(options, dir, &db);
-    if (!status.ok()) {
-      throw std::runtime_error(status.ToString());
-    }
-    init_dbs.emplace_back(db);
-  }
-  {
-    rocksdb::WriteOptions write_options;
-    write_options.disableWAL = true;
-    auto load_threads = std::vector<std::thread>();
-    {
-      for (auto &&db : init_dbs) {
-        load_threads.emplace_back(
-            [db = std::move(db), &load_db = *kv_db_, write_options, this]() {
-              fmt::print("Start loading");
-              size_t count = 0;
-              std::unique_ptr<rocksdb::Iterator> it(
-                  db->NewIterator(get_bulk_read_options()));
-              for (it->SeekToFirst(); it->Valid(); it->Next()) {
-                std::string_view key(it->key().data(), it->key().size());
-                std::string_view value(it->value().data(), it->value().size());
-                auto const shard = get_shard(key);
-                if (shard != me) {
-                  continue;
-                }
-                load_db.Put(write_options, it->key(), it->value());
-                add_no_persist(key, value);
-                count++;
-              }
-              fmt::print("Loaded {} keys from db", count);
-            });
-      }
-      for (auto &&t : load_threads) {
-        t.join();
+    std::filesystem::directory_iterator it(dir);
+    for (auto &entry : it) {
+      if (entry.path().extension() == ".sst") {
+        ssts.push_back(entry.path());
       }
     }
-    kv_initialized_ = true;
   }
+  rocksdb::IngestExternalFileArg arg;
+  arg.options.move_files = true;
+  arg.options.failed_move_fall_back_to_copy = true;
+  arg.options.snapshot_consistency = false;
+  for (auto &sst : ssts) {
+    arg.external_files.push_back(sst.string());
+  }
+  kv_db_->IngestExternalFiles({arg});
+  kv_initialized_ = true;
   open_kv_db();
 }
 
