@@ -828,6 +828,9 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
             if (store->kv_initializing_.compare_exchange_strong(init,
                                                                 true)) {
               auto init_thread= std::thread([] () {
+	          while (nr_peers == 0) {
+                    std::this_thread::yield();
+		  }
                   store->first_time_init();
               });
               init_thread.detach();
