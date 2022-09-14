@@ -13,6 +13,7 @@
 #include <exception>
 #include <fcntl.h>
 #include <fmt/format.h>
+#include <linux/time_types.h>
 #include <memory>
 #include <netinet/tcp.h>
 #include <picohttpparser/picohttpparser.h>
@@ -458,8 +459,8 @@ task<std::vector<char>> rpc_call(send_conn_state &state, char *body,
   return t;
 }
 
-task<std::optional<std::pair<std::vector<char>, std::string_view>>> remote_query(send_conn_state &state,
-                                              std::string_view key) {
+task<std::optional<std::pair<std::vector<char>, std::string_view>>>
+remote_query(send_conn_state &state, std::string_view key) {
   auto body_size = key.size() + sizeof(uint32_t);
   auto header_body =
       new char[kRPCRequestHeaderSize + key.size() + sizeof(uint32_t)];
@@ -478,7 +479,8 @@ task<std::optional<std::pair<std::vector<char>, std::string_view>>> remote_query
   auto p = response.data();
   auto value_size = *reinterpret_cast<uint32_t *>(p);
   p += sizeof(value_size);
-  co_return std::make_pair(std::move(response), std::string_view(p, value_size));
+  co_return std::make_pair(std::move(response),
+                           std::string_view(p, value_size));
 }
 
 task<void> remote_add(send_conn_state &state, std::string_view key,
@@ -1228,8 +1230,12 @@ task<void> connect_rpc_client(std::string port) {
               fmt::print("Connected to peer {} on loop {}\n", host, i);
               break;
             } catch (...) {
-              std::this_thread::sleep_for(std::chrono::milliseconds(10));
+              // ...
             }
+            struct __kernel_timespec ts;
+            ts.tv_sec = 0;
+            ts.tv_nsec = 10000000;
+            co_await loop->timeout(&ts);
           }
         }
       }
