@@ -80,7 +80,7 @@ void storage::first_time_init() {
       if (!status.ok()) {
         continue;
       }
-      threads.emplace_back([load_db, dir, i, &sst_m, &ssts] () {
+      threads.emplace_back([load_db, dir, i, &sst_m, &ssts, this] () {
         rocksdb::SstFileWriter sst_file_writer(rocksdb::EnvOptions(), get_open_options());
         auto sst_path = std::filesystem::path(dir) / "bulkload.sst";
         auto status = sst_file_writer.Open(sst_path);
@@ -89,7 +89,10 @@ void storage::first_time_init() {
         }
         auto it = load_db->NewIterator(get_bulk_read_options());
         for (it->SeekToFirst(); it->Valid(); it->Next()) {
-          sst_file_writer.Put(it->key(), it->value());
+          auto key = it->key();
+          auto value = it->value();
+          add_no_persist(key.ToStringView(), value.ToStringView());
+          sst_file_writer.Put(key, value);
         }
         sst_file_writer.Finish();
         {
