@@ -68,7 +68,6 @@ void storage::first_time_init() {
   std::vector<std::string> init_dirs;
   boost::split(init_dirs, init_dirs_env, boost::is_any_of(","));
   std::vector<std::filesystem::path> ssts;
-  rocksdb::Options options = get_open_options();
   for (auto dir : init_dirs) {
     std::filesystem::directory_iterator it(dir);
     for (auto &entry : it) {
@@ -86,7 +85,6 @@ void storage::first_time_init() {
   }
   kv_db_->IngestExternalFiles({arg});
   kv_initialized_ = true;
-  open_kv_db();
 }
 
 void storage::load_kv() {
