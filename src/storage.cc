@@ -1,5 +1,6 @@
 #include "storage.h"
 #include "rocksdb/db.h"
+#include "rocksdb/sst_file_writer.h"
 
 #include <boost/algorithm/string/classification.hpp>
 #include <boost/algorithm/string/split.hpp>
@@ -68,12 +69,36 @@ void storage::first_time_init() {
   std::vector<std::string> init_dirs;
   boost::split(init_dirs, init_dirs_env, boost::is_any_of(","));
   std::vector<std::filesystem::path> ssts;
-  for (auto dir : init_dirs) {
-    std::filesystem::directory_iterator it(dir);
-    for (auto &entry : it) {
-      if (entry.path().extension() == ".sst") {
-        ssts.push_back(entry.path());
+  std::mutex sst_m;
+  {
+    std::vector<std::jthread> threads;
+    size_t i = 0;
+    for (auto dir : init_dirs) {
+      rocksdb::DB *load_db;
+      auto status =
+          rocksdb::DB::OpenForReadOnly(get_open_options(), dir, &load_db);
+      if (!status.ok()) {
+        continue;
       }
+      threads.emplace_back([load_db, dir, i, &sst_m, &ssts] () {
+        rocksdb::SstFileWriter sst_file_writer(rocksdb::EnvOptions(), get_open_options());
+        auto sst_path = std::filesystem::path(dir) / "bulkload.sst";
+        auto status = sst_file_writer.Open(sst_path);
+        if (!status.ok()) {
+          return;
+        }
+        auto it = load_db->NewIterator(get_bulk_read_options());
+        for (it->SeekToFirst(); it->Valid(); it->Next()) {
+          sst_file_writer.Put(it->key(), it->value());
+        }
+        sst_file_writer.Finish();
+        {
+          std::scoped_lock lock(sst_m);
+          ssts.push_back(sst_path);
+        }
+        delete it;
+        delete load_db;
+      });
     }
   }
   rocksdb::IngestExternalFileArg arg;
