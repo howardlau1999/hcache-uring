@@ -820,6 +820,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
             bool init = false;
             if (peers_updated.compare_exchange_strong(init, true)) {
                 co_await connect_rpc_client("58080");
+                fmt::print("RPC client connected\n");
             }
           }
           {
@@ -1162,7 +1163,7 @@ task<void> http_server(std::shared_ptr<loop_with_queue> loop) {
 
 task<void> connect_rpc_client(std::string port) {
   (void)loop_started.load();
-  const size_t num_conns_per_shard = 2;
+  const size_t num_conns_per_shard = 4;
   try {
     co_await main_loop->switch_to_io_thread();
     fmt::print("Starting RPC client\n");
@@ -1235,6 +1236,7 @@ task<void> connect_rpc_client(std::string port) {
     rpc_connected = true;
   } catch (std::exception &e) {
     fmt::print("Failed to connect to peers {}\n", e.what());
+    peers_updated = false;
     co_return;
   }
 }
