@@ -714,7 +714,7 @@ task<void> rpc_server(std::shared_ptr<loop_with_queue> loop, std::string port) {
   size_t rpc_conn_id = 0;
   auto listener = uringpp::listener::listen(loop, "0.0.0.0", port);
   fmt::print("Starting RPC server\n");
-  co_await connect_rpc_client(port);
+  connect_rpc_client(port).detach();
   while (true) {
     auto [addr, conn] =
         co_await listener.accept(loops[rpc_conn_id % loops.size()]);
