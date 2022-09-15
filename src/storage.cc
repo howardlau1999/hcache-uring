@@ -113,6 +113,7 @@ void storage::first_time_init() {
     arg.external_files.push_back(sst.string());
   }
   kv_db_->IngestExternalFile(arg.external_files, arg.options);
+  fmt::print("Bulk load finished\n");
   kv_initialized_ = true;
 }
 

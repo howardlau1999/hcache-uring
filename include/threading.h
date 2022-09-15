@@ -15,7 +15,7 @@ void enable_on_cores(std::vector<int> const& cores) ;
 
 class io_queue {
   boost::lockfree::queue<std::coroutine_handle<>,
-                         boost::lockfree::capacity<128>>
+                         boost::lockfree::capacity<8192>>
       queue_;
 
 public:
