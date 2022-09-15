@@ -92,8 +92,10 @@ void storage::first_time_init() {
         for (it->SeekToFirst(); it->Valid(); it->Next()) {
           auto key = it->key();
           auto value = it->value();
-          if (get_shard(key.ToStringView()) == me) {
-            add_no_persist(key.ToStringView(), value.ToStringView());
+          auto key_sv = key.ToStringView();
+          auto value_sv = value.ToStringView();
+          if (get_shard(key_sv) == me) {
+            add_no_persist(key_sv, value_sv);
             sst_file_writer.Put(key, value);
           }
         }
