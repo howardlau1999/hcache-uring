@@ -24,6 +24,7 @@ static inline rocksdb::Options get_open_options() {
   options.allow_mmap_reads = true;
   options.allow_mmap_writes = true;
   options.use_adaptive_mutex = true;
+  options.unordered_write = true;
   options.DisableExtraChecks();
   options.IncreaseParallelism(4);
   return options;
@@ -55,7 +56,7 @@ static inline rocksdb::ReadOptions get_bulk_read_options() {
   rocksdb::ReadOptions read_options;
   read_options.verify_checksums = false;
   read_options.fill_cache = false;
-  read_options.adaptive_readahead = true;
+  read_options.readahead_size = 128 * 1024 * 1024;
   read_options.async_io = true;
   return read_options;
 }
@@ -72,7 +73,6 @@ void storage::first_time_init() {
   std::mutex sst_m;
   {
     std::vector<std::jthread> threads;
-    size_t i = 0;
     for (auto dir : init_dirs) {
       rocksdb::DB *load_db;
       auto status =
@@ -80,7 +80,7 @@ void storage::first_time_init() {
       if (!status.ok()) {
         continue;
       }
-      threads.emplace_back([load_db, dir, i, &sst_m, &ssts, this]() {
+      threads.emplace_back([load_db, dir, &sst_m, &ssts, this]() {
         rocksdb::SstFileWriter sst_file_writer(rocksdb::EnvOptions(),
                                                get_open_options());
         auto sst_path = std::filesystem::path(dir) / "bulkload.sst";
