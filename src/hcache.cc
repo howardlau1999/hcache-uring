@@ -708,11 +708,13 @@ task<void> rpc_reply_recv_loop(uringpp::socket &rpc_conn) {
   }
 }
 
+task<void> connect_rpc_client(std::string port);
+
 task<void> rpc_server(std::shared_ptr<loop_with_queue> loop, std::string port) {
-  co_await loop->switch_to_io_thread();
   size_t rpc_conn_id = 0;
   auto listener = uringpp::listener::listen(loop, "0.0.0.0", port);
   fmt::print("Starting RPC server\n");
+  co_await connect_rpc_client(port);
   while (true) {
     auto [addr, conn] =
         co_await listener.accept(loops[rpc_conn_id % loops.size()]);
@@ -725,8 +727,6 @@ task<void> rpc_server(std::shared_ptr<loop_with_queue> loop, std::string port) {
   }
   co_return;
 }
-
-task<void> connect_rpc_client(std::string port);
 
 task<void> handle_http(uringpp::socket conn, size_t conn_id) {
   auto conn_shard = conn_id % loops.size();
@@ -1140,7 +1140,6 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
 }
 
 task<void> http_server(std::shared_ptr<loop_with_queue> loop) {
-  co_await loop->switch_to_io_thread();
   auto listener = uringpp::listener::listen(loop, "0.0.0.0", "8080");
   size_t conn_id = 0;
   fmt::print("Starting HTTP server\n");
@@ -1278,11 +1277,6 @@ int main(int argc, char *argv[]) {
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
   rpc_server(main_loop, "58080").detach();
-  auto t = connect_rpc_client("58080");
-  while (!t.h_.done()) {
-    main_loop->run_pending();
-    main_loop->poll_no_wait();
-  }
   http_server(main_loop).detach();
   for (;;) {
     main_loop->poll();
