@@ -85,7 +85,7 @@ auto format_200_header(size_t body_length) {
                      body_length);
 }
 
-constexpr size_t kMaxWriteSize = 2 * 1024 * 1024;
+constexpr size_t kMaxWriteSize = 1024 * 1024 * 1024;
 
 task<void> send_worker(uringpp::socket &conn, std::list<output_page> &buffer,
                        std::list<output_page> &pending, bool &sending,

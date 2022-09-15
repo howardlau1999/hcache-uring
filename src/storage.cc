@@ -56,7 +56,7 @@ static inline rocksdb::ReadOptions get_bulk_read_options() {
   rocksdb::ReadOptions read_options;
   read_options.verify_checksums = false;
   read_options.fill_cache = false;
-  read_options.readahead_size = 128 * 1024 * 1024;
+  read_options.readahead_size = 512 * 1024 * 1024;
   read_options.async_io = true;
   return read_options;
 }
