@@ -72,7 +72,8 @@ void storage::first_time_init() {
   boost::split(init_dirs, init_dirs_env, boost::is_any_of(","));
   std::vector<std::string> ssts;
   std::mutex sst_m;
-  std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+  std::chrono::steady_clock::time_point start =
+      std::chrono::steady_clock::now();
   std::atomic<size_t> key_count;
   {
     std::vector<std::jthread> threads;
@@ -130,7 +131,9 @@ void storage::first_time_init() {
   ingest_options.allow_global_seqno = true;
   kv_db_->IngestExternalFile(ssts, ingest_options);
   std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now();
-  fmt::print("KV DB initialized {} keys in {}ms\n", key_count, std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count());
+  fmt::print("KV DB initialized {} keys in {}ms\n", key_count,
+             std::chrono::duration_cast<std::chrono::milliseconds>(end - start)
+                 .count());
   fmt::print("Bulk load finished\n");
   kv_initialized_ = true;
 }
@@ -227,12 +230,14 @@ void storage::add_no_persist(std::string_view key, std::string_view value) {
     return;
   }
   key_value_intl *kv = new key_value_intl(key, value);
-  kvs_.update(*kv, [](bool inserted, auto &old_kv, auto &new_kv) {
+  auto [success, is_new] = kvs_.update(*kv, [](bool inserted, auto &old_kv, auto &new_kv) {
     if (!inserted) {
       old_kv.value = new_kv.value;
-      mi_disposer<key_value_intl>()(&new_kv);
     }
   });
+  if (!is_new) {
+    mi_disposer<key_value_intl>()(kv);
+  }
   // {
   //   auto shard = std::hash<std::string_view>()(key) % nr_shards;
   //   std::unique_lock lock(kvs_mutex_[shard]);
@@ -295,15 +300,19 @@ void storage::zadd_no_persist(std::string_view key, std::string_view value,
     return;
   }
   zset_intl *zset = new zset_intl(key);
-  zsets_.update(*zset, [value, score](bool inserted, zset_intl &old_zset,
-                                      zset_intl &new_zset) {
-    if (!inserted) {
-      old_zset.zadd(score, value);
-      mi_disposer<zset_intl>()(&new_zset);
-    } else {
-      new_zset.zadd(score, value);
-    }
-  });
+  auto [success, is_new] =
+      zsets_.update(*zset, [value, score](bool inserted, zset_intl &old_zset,
+                                          zset_intl &new_zset) {
+        if (!inserted) {
+          old_zset.zadd(score, value);
+
+        } else {
+          new_zset.zadd(score, value);
+        }
+      });
+  if (!is_new) {
+    mi_disposer<zset_intl>()(zset);
+  }
   // auto shard = std::hash<std::string_view>()(key) % nr_shards;
   // {
   //   std::unique_lock lock(zsets_mutex_[shard]);

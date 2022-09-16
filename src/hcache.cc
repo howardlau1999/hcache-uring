@@ -1243,7 +1243,7 @@ task<void> connect_rpc_client(std::string port) {
 }
 
 int main(int argc, char *argv[]) {
-  main_loop = loop_with_queue::create(8192);
+  main_loop = loop_with_queue::create(4096);
   main_loop->waker().detach();
   ::signal(SIGPIPE, SIG_IGN);
   cores = get_cpu_affinity();
@@ -1266,7 +1266,7 @@ int main(int argc, char *argv[]) {
   auto flush_thread = std::thread([]() {
     for (;;) {
       store->flush();
-      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
   });
   flush_thread.detach();
@@ -1276,7 +1276,7 @@ int main(int argc, char *argv[]) {
       fmt::print("thread {} bind to core {}\n", i, core);
       bind_cpu(core);
       cds::threading::Manager::attachThread();
-      auto loop = loop_with_queue::create(8192, IORING_SETUP_ATTACH_WQ,
+      auto loop = loop_with_queue::create(32768, IORING_SETUP_ATTACH_WQ,
                                           main_loop->fd());
       loops[i] = loop;
       loop_started.fetch_add(1);
