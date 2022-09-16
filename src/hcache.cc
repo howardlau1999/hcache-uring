@@ -816,16 +816,6 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
         } break;
         case 'i': {
           // init
-          {
-            bool init = false;
-            if (store->kv_initializing_.compare_exchange_strong(init, true)) {
-              auto init_thread = std::thread([]() {
-                enable_on_cores(cores);
-                store->first_time_init();
-              });
-              init_thread.detach();
-            }
-          }
           if (store->kv_loaded()) {
             send_all(conn, sending, closed, send_buf, pending_send_buf,
                      OK_RESPONSE, sizeof(OK_RESPONSE) - 1);
@@ -919,6 +909,16 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
             if (peers_updated.compare_exchange_strong(init, true)) {
               co_await connect_rpc_client("58080");
               fmt::print("RPC client connected\n");
+            }
+          }
+          {
+            bool init = false;
+            if (store->kv_initializing_.compare_exchange_strong(init, true)) {
+              auto init_thread = std::thread([]() {
+                enable_on_cores(cores);
+                store->first_time_init();
+              });
+              init_thread.detach();
             }
           }
           send_all(conn, sending, closed, send_buf, pending_send_buf,
