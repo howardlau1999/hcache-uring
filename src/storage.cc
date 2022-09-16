@@ -20,6 +20,7 @@ char const *zset_dir = "/data/zset";
 
 static inline rocksdb::Options get_open_options() {
   rocksdb::Options options;
+  options.write_buffer_size = 512 * 1024 * 1024;
   options.create_if_missing = true;
   options.allow_mmap_reads = true;
   options.allow_mmap_writes = true;
@@ -81,14 +82,9 @@ void storage::first_time_init() {
         continue;
       }
       threads.emplace_back([load_db, dir, &sst_m, &ssts, this]() {
-        rocksdb::SstFileWriter sst_file_writer(rocksdb::EnvOptions(),
-                                               get_open_options());
-        auto sst_path = std::filesystem::path(dir) / "bulkload.sst";
-        auto status = sst_file_writer.Open(sst_path);
-        if (!status.ok()) {
-          return;
-        }
         auto it = load_db->NewIterator(get_bulk_read_options());
+        auto write_options = rocksdb::WriteOptions();
+        write_options.disableWAL = true;
         for (it->SeekToFirst(); it->Valid(); it->Next()) {
           auto key = it->key();
           auto value = it->value();
@@ -96,27 +92,14 @@ void storage::first_time_init() {
           auto value_sv = value.ToStringView();
           if (get_shard(key_sv) == me) {
             add_no_persist(key_sv, value_sv);
-            sst_file_writer.Put(key, value);
+            kv_db_->Put(write_options, key_sv, value_sv);
           }
-        }
-        sst_file_writer.Finish();
-        {
-          std::scoped_lock lock(sst_m);
-          ssts.push_back(sst_path);
         }
         delete it;
         delete load_db;
       });
     }
   }
-  rocksdb::IngestExternalFileArg arg;
-  arg.options.move_files = true;
-  arg.options.failed_move_fall_back_to_copy = true;
-  arg.options.snapshot_consistency = false;
-  for (auto &sst : ssts) {
-    arg.external_files.push_back(sst.string());
-  }
-  kv_db_->IngestExternalFile(arg.external_files, arg.options);
   fmt::print("Bulk load finished\n");
   kv_initialized_ = true;
 }
