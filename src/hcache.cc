@@ -1,3 +1,4 @@
+#include "cds/init.h"
 #include "io_buffer.h"
 #include "rpc.h"
 #include "storage.h"
@@ -69,7 +70,7 @@ size_t me = 0;
 size_t get_shard(std::string_view key) {
   if (nr_peers == 0)
     return 0;
-  auto hash = std::hash<std::string_view>{}(key);
+  auto hash = XXH64(key.data(), key.size(), 19260817);
   return hash % nr_peers;
 }
 
@@ -1247,10 +1248,20 @@ int main(int argc, char *argv[]) {
   ::signal(SIGPIPE, SIG_IGN);
   cores = get_cpu_affinity();
   loops.resize(cores.size());
+  cds::Initialize();
+  cds::gc::HP hpGC;
   store = std::make_unique<storage>();
   {
-    auto kv_thread = std::jthread([]() { store->load_kv(); });
-    auto zset_thread = std::jthread([]() { store->load_zset(); });
+    auto kv_thread = std::jthread([]() {
+      cds::threading::Manager::attachThread();
+      store->load_kv();
+      cds::threading::Manager::detachThread();
+    });
+    auto zset_thread = std::jthread([]() {
+      cds::threading::Manager::attachThread();
+      store->load_zset();
+      cds::threading::Manager::detachThread();
+    });
   }
   auto flush_thread = std::thread([]() {
     for (;;) {
@@ -1264,6 +1275,7 @@ int main(int argc, char *argv[]) {
     auto thread = std::thread([i, core = cores[i]] {
       fmt::print("thread {} bind to core {}\n", i, core);
       bind_cpu(core);
+      cds::threading::Manager::attachThread();
       auto loop = loop_with_queue::create(8192, IORING_SETUP_ATTACH_WQ,
                                           main_loop->fd());
       loops[i] = loop;
@@ -1283,5 +1295,6 @@ int main(int argc, char *argv[]) {
   for (;;) {
     main_loop->poll();
   }
+  cds::Terminate();
   return 0;
 }

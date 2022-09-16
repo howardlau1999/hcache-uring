@@ -4,6 +4,7 @@
 #include "rpc.h"
 #include "uringpp/task.h"
 #include <algorithm>
+#include "xxhash.h"
 #include <boost/multi_index/hashed_index.hpp>
 #include <boost/multi_index/member.hpp>
 #include <boost/multi_index_container.hpp>
@@ -39,10 +40,10 @@ struct index_string {
 
 struct string_view_hash {
   std::size_t operator()(const std::string_view &v) const {
-    return boost::hash_range(v.begin(), v.end());
+    return XXH64(v.data(), v.size(), 19260817);
   }
   std::size_t operator()(const std::string &s) const {
-    return boost::hash_range(s.begin(), s.end());
+    return XXH64(s.data(), s.size(), 19260817);
   }
 };
 
@@ -145,10 +146,10 @@ struct hash1 {
   size_t operator()(const zset_intl &zset) const { return (*this)(zset.key); }
   size_t operator()(const key_value_intl &kv) const { return (*this)(kv.key); }
   size_t operator()(std::string_view key) const {
-    return cds::opt::v::hash<std::string_view>{}(key);
+    return XXH64(key.data(), key.size(), 19260817);
   }
   size_t operator()(const std::string &key) const {
-    return cds::opt::v::hash<std::string>{}(key);
+    return XXH64(key.data(), key.size(), 19260817);
   }
 };
 
@@ -156,11 +157,10 @@ struct hash2 : public hash1 {
   size_t operator()(const zset_intl &zset) const { return (*this)(zset.key); }
   size_t operator()(const key_value_intl &kv) const { return (*this)(kv.key); }
   size_t operator()(std::string_view key) const {
-    size_t h1 = ~(hash1::operator()(key));
-    return h1 * 19260817 + (h1 << 5) + (h1 >> 2);
+    return std::hash<std::string_view>()(key);
   }
   size_t operator()(const std::string &key) const {
-    return (*this)(std::string_view(key));
+    return std::hash<std::string_view>()(key);
   }
 };
 
@@ -187,12 +187,12 @@ class storage {
   std::atomic<bool> kv_initialized_;
   rocksdb::WriteOptions write_options_;
 
-  unordered_string_map<std::string> kvs_[nr_shards];
-  std::shared_mutex kvs_mutex_[nr_shards];
-  unordered_string_map<std::unique_ptr<zset_stl>> zsets_[nr_shards];
-  std::shared_mutex zsets_mutex_[nr_shards];
-  // kv_cuckoo_set kvs_;
-  // zset_cuckoo_set zsets_;
+  // unordered_string_map<std::string> kvs_[nr_shards];
+  // std::shared_mutex kvs_mutex_[nr_shards];
+  // unordered_string_map<std::unique_ptr<zset_stl>> zsets_[nr_shards];
+  // std::shared_mutex zsets_mutex_[nr_shards];
+  kv_cuckoo_set kvs_;
+  zset_cuckoo_set zsets_;
 
   void open_kv_db();
 
