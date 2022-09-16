@@ -32,7 +32,7 @@ static inline rocksdb::Options get_open_options() {
 }
 
 storage::storage() : kv_initialized_(false), kv_initializing_(false) {
-
+  write_options_.disableWAL = true;
   rocksdb::DB *db;
   auto status = rocksdb::DB::Open(get_open_options(), zset_dir, &db);
   if (!status.ok()) {
@@ -83,16 +83,13 @@ void storage::first_time_init() {
       }
       threads.emplace_back([load_db, dir, &sst_m, &ssts, this]() {
         auto it = load_db->NewIterator(get_bulk_read_options());
-        auto write_options = rocksdb::WriteOptions();
-        write_options.disableWAL = true;
         for (it->SeekToFirst(); it->Valid(); it->Next()) {
           auto key = it->key();
           auto value = it->value();
           auto key_sv = key.ToStringView();
           auto value_sv = value.ToStringView();
           if (get_shard(key_sv) == me) {
-            add_no_persist(key_sv, value_sv);
-            kv_db_->Put(write_options, key_sv, value_sv);
+            add(key_sv, value_sv);
           }
         }
         delete it;
@@ -214,15 +211,9 @@ void storage::add_no_persist(std::string_view key, std::string_view value) {
   }
 }
 
-static inline rocksdb::WriteOptions get_write_options() {
-  rocksdb::WriteOptions write_options;
-  write_options.disableWAL = true;
-  return write_options;
-}
-
 void storage::add(std::string_view key, std::string_view value) {
   add_no_persist(key, value);
-  kv_db_->Put(get_write_options(), key, value);
+  kv_db_->Put(write_options_, key, value);
 }
 
 void storage::del(std::string_view key) {
@@ -244,7 +235,7 @@ void storage::del(std::string_view key) {
       zsets_[shard].erase(it);
     }
   }
-  kv_db_->Delete(get_write_options(), key);
+  kv_db_->Delete(write_options_, key);
 }
 
 void zset_stl::zadd(uint32_t score, std::string_view value) {
@@ -305,7 +296,7 @@ void storage::zadd(std::string_view key, std::string_view value,
   zadd_no_persist(key, value, score);
   auto full_key = encode_zset_key(key, value);
   zset_db_->Put(
-      get_write_options(), rocksdb::Slice(full_key.data(), full_key.size()),
+      write_options_, rocksdb::Slice(full_key.data(), full_key.size()),
       rocksdb::Slice(reinterpret_cast<const char *>(&score), sizeof(score)));
 }
 
@@ -314,7 +305,7 @@ void storage::zrmv(std::string_view key, std::string_view value) {
   //   cds::threading::Manager::attachThread();
   // }
   auto full_key = encode_zset_key(key, value);
-  zset_db_->Delete(get_write_options(),
+  zset_db_->Delete(write_options_,
                    rocksdb::Slice(full_key.data(), full_key.size()));
   // zsets_.find(key, [value](zset_intl &zset, ...) {
   //   std::lock_guard lock(zset.mutex);

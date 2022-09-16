@@ -1,5 +1,6 @@
 #pragma once
 
+#include "rocksdb/options.h"
 #include "rpc.h"
 #include "uringpp/task.h"
 #include <algorithm>
@@ -184,6 +185,7 @@ class storage {
   std::unique_ptr<rocksdb::DB> kv_db_;
   std::unique_ptr<rocksdb::DB> zset_db_;
   std::atomic<bool> kv_initialized_;
+  rocksdb::WriteOptions write_options_;
 
   unordered_string_map<std::string> kvs_[nr_shards];
   std::shared_mutex kvs_mutex_[nr_shards];
