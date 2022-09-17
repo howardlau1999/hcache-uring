@@ -55,6 +55,7 @@ struct conn_pool {
 };
 
 std::vector<std::shared_ptr<loop_with_queue>> loops;
+std::vector<std::shared_ptr<loop_with_queue>> rpc_loops;
 std::vector<std::vector<conn_pool>> rpc_clients;
 std::atomic<size_t> loop_started = 0;
 std::atomic<size_t> clients_connected = 0;
@@ -210,7 +211,7 @@ constexpr size_t kRPCRequestHeaderSize =
     sizeof(uint64_t) + sizeof(method) + sizeof(uint32_t);
 
 task<void> handle_rpc(uringpp::socket conn, size_t conn_id) {
-  auto loop = loops[conn_id % loops.size()];
+  auto loop = rpc_loops[conn_id % rpc_loops.size()];
   co_await loop->switch_to_io_thread();
   io_buffer request(65536);
   int state = kStateRecvHeader;
@@ -718,7 +719,7 @@ task<void> rpc_server(std::shared_ptr<loop_with_queue> loop, std::string port) {
   connect_rpc_client(port).detach();
   while (true) {
     auto [addr, conn] =
-        co_await listener.accept(loops[rpc_conn_id % loops.size()]);
+        co_await listener.accept(rpc_loops[rpc_conn_id % rpc_loops.size()]);
     {
       int flags = 1;
       setsockopt(conn.fd(), SOL_TCP, TCP_NODELAY, (void *)&flags,
@@ -909,6 +910,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
             bool init = false;
             if (peers_updated.compare_exchange_strong(init, true)) {
               co_await connect_rpc_client("58080");
+              co_await loop->switch_to_io_thread();
               fmt::print("RPC client connected\n");
             }
           }
@@ -1248,6 +1250,7 @@ int main(int argc, char *argv[]) {
   ::signal(SIGPIPE, SIG_IGN);
   cores = get_cpu_affinity();
   loops.resize(cores.size());
+  rpc_loops.resize(cores.size());
   cds::Initialize();
   cds::gc::HP hpGC;
   store = std::make_unique<storage>();
@@ -1288,6 +1291,26 @@ int main(int argc, char *argv[]) {
     thread.detach();
   }
   while (loop_started.load() != cores.size()) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  loop_started = 0;
+  for (int i = 0; i < cores.size(); ++i) {
+    auto thread = std::thread([i, core = cores[i]] {
+      fmt::print("RPC Thread {} bind to core {}\n", i, core);
+      bind_cpu(core);
+      cds::threading::Manager::attachThread();
+      auto loop = loop_with_queue::create(32768, IORING_SETUP_ATTACH_WQ,
+                                          main_loop->fd());
+      rpc_loops[i] = loop;
+      loop_started.fetch_add(1);
+      loop->waker().detach();
+      for (;;) {
+        loop->poll();
+      }
+    });
+    thread.detach();
+  }
+    while (loop_started.load() != cores.size()) {
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
   rpc_server(main_loop, "58080").detach();
