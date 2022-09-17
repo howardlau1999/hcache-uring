@@ -3,13 +3,17 @@
 #include <sys/eventfd.h>
 
 std::shared_ptr<loop_with_queue>
-loop_with_queue::create(unsigned int entries, uint32_t flags, int wq_fd) {
-  return std::make_shared<loop_with_queue>(entries, flags, wq_fd);
+loop_with_queue::create(unsigned int entries, uint32_t flags, int wq_fd,
+                        int sq_thread_cpu, int sq_thread_idle) {
+  return std::make_shared<loop_with_queue>(entries, flags, wq_fd, sq_thread_cpu,
+                                           sq_thread_idle);
 }
 
 loop_with_queue::loop_with_queue(unsigned int entries, uint32_t flags,
-                                 int wq_fd)
-    : uringpp::event_loop(entries, flags, wq_fd), queue_() {
+                                 int wq_fd, int sq_thread_cpu,
+                                 int sq_thread_idle)
+    : uringpp::event_loop(entries, flags, wq_fd, sq_thread_cpu, sq_thread_idle),
+      queue_() {
   efd_ = ::eventfd(0, 0);
   if (efd_ < 0) {
     throw std::runtime_error(
@@ -34,7 +38,7 @@ std::vector<int> get_cpu_affinity() {
   return cores;
 }
 
-void enable_on_cores(std::vector<int> const& cores) {
+void enable_on_cores(std::vector<int> const &cores) {
   cpu_set_t cpuset;
   CPU_ZERO(&cpuset);
   for (auto core : cores) {

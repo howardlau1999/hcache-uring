@@ -1,44 +1,23 @@
-#include "cds/init.h"
+#include "f-stack-co/event_loop.h"
+#include "f-stack-co/init.h"
+#include "f-stack-co/task.h"
+#include "f-stack-co/tcp_connection.h"
+#include "f-stack-co/tcp_listener.h"
+#include "fmt/format.h"
 #include "io_buffer.h"
-#include "rapidjson/stringbuffer.h"
-#include "rpc.h"
+#include "picohttpparser/picohttpparser.h"
 #include "storage.h"
 #include "threading.h"
-#include <algorithm>
-#include <array>
-#include <bits/types/struct_iovec.h>
-#include <cassert>
-#include <chrono>
-#include <coroutine>
-#include <csignal>
-#include <cstdint>
-#include <exception>
-#include <fcntl.h>
-#include <fmt/format.h>
-#include <linux/time_types.h>
+#include <fstream>
 #include <memory>
-#include <netinet/tcp.h>
-#include <picohttpparser/picohttpparser.h>
 #include <rapidjson/document.h>
-#include <rapidjson/rapidjson.h>
 #include <rapidjson/writer.h>
 #include <simdjson.h>
-#include <string>
-#include <string_view>
-#include <strings.h>
-#include <sys/socket.h>
-#include <thread>
-#include <unordered_set>
-#include <uringpp/event_loop.h>
-#include <uringpp/file.h>
-#include <uringpp/listener.h>
-#include <uringpp/socket.h>
-#include <uringpp/task.h>
 
-using uringpp::task;
+using fstackco::task;
 
 struct send_conn_state {
-  std::unique_ptr<uringpp::socket> conn;
+  std::unique_ptr<fstackco::tcp_connection> conn;
   std::list<output_page> send_buf;
   std::list<output_page> pending_send_buf;
   bool sending;
@@ -55,13 +34,18 @@ struct conn_pool {
   }
 };
 
-std::vector<std::shared_ptr<loop_with_queue>> loops;
-std::vector<std::shared_ptr<loop_with_queue>> rpc_loops;
+std::vector<int> event_fds;
+std::vector<int> rpc_event_fds;
+std::vector<io_queue> io_queues;
+std::vector<io_queue> rpc_io_queues;
+std::vector<std::shared_ptr<fstackco::event_loop>> loops;
+std::vector<std::shared_ptr<fstackco::event_loop>> rpc_loops;
 std::vector<std::vector<conn_pool>> rpc_clients;
 std::atomic<size_t> loop_started = 0;
 std::atomic<size_t> clients_connected = 0;
 std::unique_ptr<storage> store;
-std::shared_ptr<loop_with_queue> main_loop;
+io_queue main_io_queue;
+std::shared_ptr<fstackco::event_loop> main_loop;
 std::vector<std::string> peer_hosts;
 std::atomic<bool> peers_updated = false;
 std::atomic<bool> rpc_connected = false;
@@ -82,62 +66,91 @@ const char OK_RESPONSE[] = "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok";
 const char EMPTY_RESPONSE[] = "HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n";
 const char LOADING_RESPONSE[] =
     "HTTP/1.1 200 OK\r\ncontent-length: 7\r\n\r\nloading";
-const char HTTP_200_HEADER[] = "HTTP/1.1 200 OK\r\ncontent-length: ";
-const char HEADER_END[] = "\r\n\r\n";
 
-constexpr size_t kMaxWriteSize = 1024 * 1024 * 1024;
-
-size_t itoa(char *buf, size_t n) {
-  size_t i = 0;
-  if (n == 0) {
-    buf[i++] = '0';
-    return i;
-  }
-  while (n) {
-    buf[i++] = n % 10 + '0';
-    n /= 10;
-  }
-  std::reverse(buf, buf + i);
-  return i;
+auto format_200_header(size_t body_length) {
+  return fmt::format("HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n",
+                     body_length);
 }
 
-[[nodiscard]] uringpp::task<void>
-send_json(uringpp::socket &conn, rapidjson::StringBuffer const &buffer) {
+task<void> send_worker(fstackco::tcp_connection &conn,
+                       std::list<output_page> &buffer,
+                       std::list<output_page> &pending, bool &sending,
+                       bool &closed) {
+  sending = true;
+  while (buffer.size() > 0) {
+    for (auto &page : buffer) {
+      while (page.sent < page.size) {
+        auto sent =
+            co_await conn.write(page.data + page.sent, page.size - page.sent);
+        if (sent == 0) {
+          closed = true;
+          co_return;
+        }
+        page.sent += sent;
+      }
+    }
+    buffer.clear();
+    if (!pending.empty()) {
+      std::swap(buffer, pending);
+    }
+  }
+  sending = false;
+}
+
+void send_all(fstackco::tcp_connection &conn, bool &sending, bool &closed,
+              std::list<output_page> &send_buf,
+              std::list<output_page> &pending_send_buf, char const *data,
+              size_t len, bool owned = false) {
+  if (closed)
+    return;
+  if (sending) {
+    pending_send_buf.emplace_back(const_cast<char *>(data), len, 0, owned);
+  } else {
+    send_buf.emplace_back(const_cast<char *>(data), len, 0, owned);
+    send_worker(conn, send_buf, pending_send_buf, sending, closed).detach();
+  }
+}
+
+void send_all(fstackco::tcp_connection &conn, bool &sending, bool &closed,
+              std::list<output_page> &send_buf,
+              std::list<output_page> &pending_send_buf,
+              std::list<output_page> &pages) {
+  if (closed)
+    return;
+  if (sending) {
+    pending_send_buf.splice(pending_send_buf.end(), pages);
+  } else {
+    send_buf.splice(send_buf.end(), pages);
+    send_worker(conn, send_buf, pending_send_buf, sending, closed).detach();
+  }
+}
+
+void send_json(fstackco::tcp_connection &conn, bool &sending, bool &closed,
+               std::list<output_page> &send_buf,
+               std::list<output_page> &pending_send_buf,
+               json_output_stream &buffer) {
   {
-    char length[8];
-    size_t len_chars = itoa(length, buffer.GetSize());
-    auto header_size =
-        sizeof(HTTP_200_HEADER) + len_chars + sizeof(HEADER_END) - 2;
-    struct iovec iov[4];
-    iov[0].iov_base = const_cast<char *>(HTTP_200_HEADER);
-    iov[0].iov_len = sizeof(HTTP_200_HEADER) - 1;
-    iov[1].iov_base = length;
-    iov[1].iov_len = len_chars;
-    iov[2].iov_base = const_cast<char *>(HEADER_END);
-    iov[2].iov_len = sizeof(HEADER_END) - 1;
-    iov[3].iov_base = (void *)buffer.GetString();
-    iov[3].iov_len = buffer.GetSize();
-    co_await conn.writev(iov, 4);
+    auto header = format_200_header(buffer.GetSize());
+    auto data = new char[header.size()];
+    std::copy_n(header.data(), header.size(), data);
+    send_all(conn, sending, closed, send_buf, pending_send_buf, data,
+             header.size(), true);
   }
+  send_all(conn, sending, closed, send_buf, pending_send_buf, buffer.pages_);
 }
 
-[[nodiscard]] uringpp::task<void>
-send_text(uringpp::socket &conn, bool &sending, bool &closed,
-          std::list<output_page> &send_buf,
-          std::list<output_page> &pending_send_buf, char *data, size_t len) {
-
-  char length[8];
-  size_t len_chars = itoa(length, len);
-  struct iovec iov[4];
-  iov[0].iov_base = const_cast<char *>(HTTP_200_HEADER);
-  iov[0].iov_len = sizeof(HTTP_200_HEADER) - 1;
-  iov[1].iov_base = length;
-  iov[1].iov_len = len_chars;
-  iov[2].iov_base = const_cast<char *>(HEADER_END);
-  iov[2].iov_len = sizeof(HEADER_END) - 1;
-  iov[3].iov_base = data;
-  iov[3].iov_len = len;
-  auto n = co_await conn.writev(iov, 4);
+void send_text(fstackco::tcp_connection &conn, bool &sending, bool &closed,
+               std::list<output_page> &send_buf,
+               std::list<output_page> &pending_send_buf, char *data,
+               size_t len) {
+  {
+    auto header = format_200_header(len);
+    auto header_data = new char[header.size()];
+    std::copy_n(header.data(), header.size(), header_data);
+    send_all(conn, sending, closed, send_buf, pending_send_buf, header_data,
+             header.size(), true);
+  }
+  send_all(conn, sending, closed, send_buf, pending_send_buf, data, len, true);
 }
 
 constexpr int kStateRecvHeader = 0;
@@ -145,26 +158,21 @@ constexpr int kStateRecvBody = 1;
 constexpr int kStateProcess = 2;
 
 constexpr size_t kRPCReplyHeaderSize = sizeof(uint64_t) + sizeof(uint32_t);
-uringpp::task<void> rpc_reply(uringpp::socket &conn, uint64_t req_id,
-                              uint32_t len, std::vector<char> const &data) {
+char *rpc_reply_header(uint64_t req_id, uint32_t len) {
   auto header = new char[kRPCReplyHeaderSize];
   std::copy_n(reinterpret_cast<char *>(&req_id), sizeof(req_id), header);
   std::copy_n(reinterpret_cast<char *>(&len), sizeof(len),
               header + sizeof(req_id));
-  struct iovec iov[2];
-  iov[0].iov_base = header;
-  iov[0].iov_len = kRPCReplyHeaderSize;
-  iov[1].iov_base = const_cast<char *>(data.data());
-  iov[1].iov_len = len;
-  co_await conn.writev(iov, 2);
+  return header;
 }
 
 constexpr size_t kRPCRequestHeaderSize =
     sizeof(uint64_t) + sizeof(method) + sizeof(uint32_t);
 
-task<void> handle_rpc(uringpp::socket conn, size_t conn_id) {
+task<void> handle_rpc(fstackco::tcp_connection conn, size_t conn_id) {
   auto loop = rpc_loops[conn_id % rpc_loops.size()];
-  co_await loop->switch_to_io_thread();
+  co_await rpc_io_queues[conn_id % rpc_io_queues.size()].queue_in_loop(
+      rpc_event_fds[0]);
   io_buffer request(65536);
   int state = kStateRecvHeader;
   uint64_t req_id = 0;
@@ -199,7 +207,7 @@ task<void> handle_rpc(uringpp::socket conn, size_t conn_id) {
       }
     }
     if (state != kStateProcess) {
-      auto n = co_await conn.recv(request.write_data(), request.writable());
+      auto n = co_await conn.read(request.write_data(), request.writable());
       if (n <= 0) {
         fmt::print("recv error: {} writable {}\n", n, request.writable());
         co_return;
@@ -217,15 +225,20 @@ task<void> handle_rpc(uringpp::socket conn, size_t conn_id) {
       req_p += key_size;
       auto value = store->query(key);
       if (value.first) {
+        auto header = rpc_reply_header(req_id, value.second + sizeof(uint32_t));
         auto size_u32 = static_cast<uint32_t>(value.second);
-        auto rep_body = std::vector<char>(value.second + sizeof(size_u32));
+        auto rep_body = new char[value.second + sizeof(size_u32)];
         std::copy_n(reinterpret_cast<char *>(&size_u32), sizeof(size_u32),
-                    rep_body.begin());
-        std::copy_n(value.first, value.second,
-                    rep_body.begin() + sizeof(size_u32));
-        co_await rpc_reply(conn, req_id, rep_body.size(), rep_body);
+                    rep_body);
+        std::copy_n(value.first, value.second, rep_body + sizeof(size_u32));
+        send_all(conn, sending, closed, send_buf, pending_send_buf, header,
+                 kRPCReplyHeaderSize, true);
+        send_all(conn, sending, closed, send_buf, pending_send_buf, rep_body,
+                 value.second + sizeof(size_u32), true);
       } else {
-        co_await rpc_reply(conn, req_id, 0, {});
+        auto header = rpc_reply_header(req_id, 0);
+        send_all(conn, sending, closed, send_buf, pending_send_buf, header,
+                 kRPCReplyHeaderSize, true);
       }
     } break;
     case method::add: {
@@ -238,7 +251,9 @@ task<void> handle_rpc(uringpp::socket conn, size_t conn_id) {
       std::string_view value(req_p, value_size);
       req_p += value_size;
       store->add(key, value);
-      co_await rpc_reply(conn, req_id, 0, {});
+      auto header = rpc_reply_header(req_id, 0);
+      send_all(conn, sending, closed, send_buf, pending_send_buf, header,
+               kRPCReplyHeaderSize, true);
     } break;
     case method::del: {
       uint32_t key_size = *reinterpret_cast<uint32_t *>(req_p);
@@ -246,7 +261,9 @@ task<void> handle_rpc(uringpp::socket conn, size_t conn_id) {
       std::string_view key(req_p, key_size);
       req_p += key_size;
       store->del(key);
-      co_await rpc_reply(conn, req_id, 0, {});
+      auto header = rpc_reply_header(req_id, 0);
+      send_all(conn, sending, closed, send_buf, pending_send_buf, header,
+               kRPCReplyHeaderSize, true);
     } break;
     case method::list: {
       uint32_t key_count = *reinterpret_cast<uint32_t *>(req_p);
@@ -264,8 +281,8 @@ task<void> handle_rpc(uringpp::socket conn, size_t conn_id) {
       for (auto &v : values) {
         rep_body_size += sizeof(uint32_t) * 2 + v.key.size() + v.value.size();
       }
-      auto rep_body = std::vector<char>(rep_body_size);
-      auto p = &rep_body[0];
+      auto rep_body = new char[rep_body_size];
+      auto p = rep_body;
       *reinterpret_cast<uint32_t *>(p) = values.size();
       p += sizeof(uint32_t);
       for (auto &v : values) {
@@ -278,7 +295,11 @@ task<void> handle_rpc(uringpp::socket conn, size_t conn_id) {
         std::copy_n(v.value.data(), v.value.size(), p);
         p += v.value.size();
       }
-      co_await rpc_reply(conn, req_id, rep_body.size(), rep_body);
+      auto header = rpc_reply_header(req_id, rep_body_size);
+      send_all(conn, sending, closed, send_buf, pending_send_buf, header,
+               kRPCReplyHeaderSize, true);
+      send_all(conn, sending, closed, send_buf, pending_send_buf, rep_body,
+               rep_body_size, true);
     } break;
     case method::batch: {
       uint32_t count = *reinterpret_cast<uint32_t *>(req_p);
@@ -294,7 +315,9 @@ task<void> handle_rpc(uringpp::socket conn, size_t conn_id) {
         req_p += value_size;
         store->add(key, value);
       }
-      co_await rpc_reply(conn, req_id, 0, {});
+      auto header = rpc_reply_header(req_id, 0);
+      send_all(conn, sending, closed, send_buf, pending_send_buf, header,
+               kRPCReplyHeaderSize, true);
     } break;
     case method::zadd: {
       uint32_t key_size = *reinterpret_cast<uint32_t *>(req_p);
@@ -308,7 +331,9 @@ task<void> handle_rpc(uringpp::socket conn, size_t conn_id) {
       uint32_t score = *reinterpret_cast<uint32_t *>(req_p);
       req_p += sizeof(score);
       store->zadd(key, value, score);
-      co_await rpc_reply(conn, req_id, 0, {});
+      auto header = rpc_reply_header(req_id, 0);
+      send_all(conn, sending, closed, send_buf, pending_send_buf, header,
+               kRPCReplyHeaderSize, true);
     } break;
     case method::zrmv: {
       uint32_t key_size = *reinterpret_cast<uint32_t *>(req_p);
@@ -320,7 +345,9 @@ task<void> handle_rpc(uringpp::socket conn, size_t conn_id) {
       std::string_view value(req_p, value_size);
       req_p += value_size;
       store->zrmv(key, value);
-      co_await rpc_reply(conn, req_id, 0, {});
+      auto header = rpc_reply_header(req_id, 0);
+      send_all(conn, sending, closed, send_buf, pending_send_buf, header,
+               kRPCReplyHeaderSize, true);
     } break;
     case method::zrange: {
       uint32_t key_size = *reinterpret_cast<uint32_t *>(req_p);
@@ -333,15 +360,17 @@ task<void> handle_rpc(uringpp::socket conn, size_t conn_id) {
       req_p += sizeof(max_score);
       auto values = store->zrange(key, min_score, max_score);
       if (!values.has_value()) {
-        co_await rpc_reply(conn, req_id, 0, {});
+        auto header = rpc_reply_header(req_id, 0);
+        send_all(conn, sending, closed, send_buf, pending_send_buf, header,
+                 kRPCReplyHeaderSize, true);
       } else {
         auto const &score_values = values.value();
         size_t rep_body_size = sizeof(uint32_t);
         for (auto &v : score_values) {
           rep_body_size += sizeof(uint32_t) * 2 + v.value.size();
         }
-        auto rep_body = std::vector<char>(rep_body_size);
-        auto p = &rep_body[0];
+        auto rep_body = new char[rep_body_size];
+        auto p = rep_body;
         *reinterpret_cast<uint32_t *>(p) = score_values.size();
         p += sizeof(uint32_t);
         for (auto &sv : score_values) {
@@ -352,7 +381,11 @@ task<void> handle_rpc(uringpp::socket conn, size_t conn_id) {
           *reinterpret_cast<uint32_t *>(p) = sv.score;
           p += sizeof(uint32_t);
         }
-        co_await rpc_reply(conn, req_id, rep_body.size(), rep_body);
+        auto header = rpc_reply_header(req_id, rep_body_size);
+        send_all(conn, sending, closed, send_buf, pending_send_buf, header,
+                 kRPCReplyHeaderSize, true);
+        send_all(conn, sending, closed, send_buf, pending_send_buf, rep_body,
+                 rep_body_size, true);
       }
     } break;
     }
@@ -367,19 +400,24 @@ struct pending_call {
   std::vector<char> response;
 };
 
-task<std::vector<char>> send_rpc_request(uringpp::socket &rpc_conn,
-                                         std::vector<char> const &body,
-                                         size_t len, pending_call *pending) {
-  co_await rpc_conn.send(body.data(), len);
+task<std::vector<char>>
+send_rpc_request(fstackco::tcp_connection &rpc_conn,
+                 std::list<output_page> &send_buf,
+                 std::list<output_page> &pending_send_buf, bool &sending,
+                 bool &closed, char *body, size_t len, pending_call *pending) {
+  co_await std::suspend_always{};
+  send_all(rpc_conn, sending, closed, send_buf, pending_send_buf, body, len,
+           true);
   co_await std::suspend_always{};
   co_return std::move(pending->response);
 }
 
-task<std::vector<char>> rpc_call(send_conn_state &state,
-                                 std::vector<char> &body, size_t len) {
+task<std::vector<char>> rpc_call(send_conn_state &state, char *body,
+                                 size_t len) {
   auto pending = new pending_call;
-  auto t = send_rpc_request(*state.conn, body, len, pending);
-  *reinterpret_cast<uint64_t *>(&body[0]) = reinterpret_cast<uint64_t>(pending);
+  auto t = send_rpc_request(*state.conn, state.send_buf, state.pending_send_buf,
+                            state.sending, state.closed, body, len, pending);
+  *reinterpret_cast<uint64_t *>(body) = reinterpret_cast<uint64_t>(pending);
   pending->h = t.h_;
   pending->h.resume();
   return t;
@@ -388,15 +426,15 @@ task<std::vector<char>> rpc_call(send_conn_state &state,
 task<std::optional<std::pair<std::vector<char>, std::string_view>>>
 remote_query(send_conn_state &state, std::string_view key) {
   auto body_size = key.size() + sizeof(uint32_t);
-  auto header_body = std::vector<char>(body_size + sizeof(uint32_t));
-  *reinterpret_cast<method *>(&header_body[sizeof(uint64_t)]) = method::query;
-  *reinterpret_cast<uint32_t *>(
-      &header_body[sizeof(uint64_t) + sizeof(method)]) = body_size;
-  *reinterpret_cast<uint32_t *>(
-      &header_body[sizeof(uint64_t) + sizeof(method) + sizeof(uint32_t)]) =
-      key.size();
+  auto header_body =
+      new char[kRPCRequestHeaderSize + key.size() + sizeof(uint32_t)];
+  *reinterpret_cast<method *>(header_body + sizeof(uint64_t)) = method::query;
+  *reinterpret_cast<uint32_t *>(header_body + sizeof(uint64_t) +
+                                sizeof(method)) = body_size;
+  *reinterpret_cast<uint32_t *>(header_body + sizeof(uint64_t) +
+                                sizeof(method) + sizeof(uint32_t)) = key.size();
   std::copy_n(key.data(), key.size(),
-              header_body.begin() + kRPCRequestHeaderSize + sizeof(uint32_t));
+              header_body + kRPCRequestHeaderSize + sizeof(uint32_t));
   auto response =
       co_await rpc_call(state, header_body, kRPCRequestHeaderSize + body_size);
   if (response.empty()) {
@@ -412,11 +450,11 @@ remote_query(send_conn_state &state, std::string_view key) {
 task<void> remote_add(send_conn_state &state, std::string_view key,
                       std::string_view value) {
   auto body_size = key.size() + value.size() + sizeof(uint32_t) * 2;
-  auto header_body = std::vector<char>(kRPCRequestHeaderSize + body_size);
-  *reinterpret_cast<method *>(&header_body[sizeof(uint64_t)]) = method::add;
-  *reinterpret_cast<uint32_t *>(&header_body[0] + sizeof(uint64_t) +
+  auto header_body = new char[kRPCRequestHeaderSize + body_size];
+  *reinterpret_cast<method *>(header_body + sizeof(uint64_t)) = method::add;
+  *reinterpret_cast<uint32_t *>(header_body + sizeof(uint64_t) +
                                 sizeof(method)) = body_size;
-  auto body_p = &header_body[0] + kRPCRequestHeaderSize;
+  auto body_p = header_body + kRPCRequestHeaderSize;
   *reinterpret_cast<uint32_t *>(body_p) = key.size();
   body_p += sizeof(uint32_t);
   std::copy_n(key.data(), key.size(), body_p);
@@ -429,11 +467,11 @@ task<void> remote_add(send_conn_state &state, std::string_view key,
 
 task<void> remote_del(send_conn_state &state, std::string_view key) {
   auto body_size = key.size() + sizeof(uint32_t);
-  auto header_body = std::vector<char>(kRPCRequestHeaderSize + body_size);
-  *reinterpret_cast<method *>(&header_body[sizeof(uint64_t)]) = method::del;
-  *reinterpret_cast<uint32_t *>(&header_body[0] + sizeof(uint64_t) +
+  auto header_body = new char[kRPCRequestHeaderSize + body_size];
+  *reinterpret_cast<method *>(header_body + sizeof(uint64_t)) = method::del;
+  *reinterpret_cast<uint32_t *>(header_body + sizeof(uint64_t) +
                                 sizeof(method)) = body_size;
-  auto body_p = &header_body[0] + kRPCRequestHeaderSize;
+  auto body_p = header_body + kRPCRequestHeaderSize;
   *reinterpret_cast<uint32_t *>(body_p) = key.size();
   body_p += sizeof(uint32_t);
   std::copy_n(key.data(), key.size(), body_p);
@@ -446,11 +484,11 @@ task<void> remote_batch(send_conn_state &state,
   for (auto const &kv : kvs) {
     body_size += sizeof(uint32_t) * 2 + kv.key.size() + kv.value.size();
   }
-  auto header_body = std::vector<char>(kRPCRequestHeaderSize + body_size);
-  *reinterpret_cast<method *>(&header_body[sizeof(uint64_t)]) = method::batch;
-  *reinterpret_cast<uint32_t *>(&header_body[0] + sizeof(uint64_t) +
+  auto header_body = new char[kRPCRequestHeaderSize + body_size];
+  *reinterpret_cast<method *>(header_body + sizeof(uint64_t)) = method::batch;
+  *reinterpret_cast<uint32_t *>(header_body + sizeof(uint64_t) +
                                 sizeof(method)) = body_size;
-  auto body_p = &header_body[0] + kRPCRequestHeaderSize;
+  auto body_p = header_body + kRPCRequestHeaderSize;
   *reinterpret_cast<uint32_t *>(body_p) = kvs.size();
   body_p += sizeof(uint32_t);
   for (auto const &kv : kvs) {
@@ -473,11 +511,11 @@ remote_list(send_conn_state &state,
   for (auto const &key : keys) {
     body_size += sizeof(uint32_t) + key.size();
   }
-  auto header_body = std::vector<char>(kRPCRequestHeaderSize + body_size);
-  *reinterpret_cast<method *>(&header_body[sizeof(uint64_t)]) = method::list;
-  *reinterpret_cast<uint32_t *>(&header_body[0] + sizeof(uint64_t) +
+  auto header_body = new char[kRPCRequestHeaderSize + body_size];
+  *reinterpret_cast<method *>(header_body + sizeof(uint64_t)) = method::list;
+  *reinterpret_cast<uint32_t *>(header_body + sizeof(uint64_t) +
                                 sizeof(method)) = body_size;
-  auto body_p = &header_body[0] + kRPCRequestHeaderSize;
+  auto body_p = header_body + kRPCRequestHeaderSize;
   *reinterpret_cast<uint32_t *>(body_p) = keys.size();
   body_p += sizeof(uint32_t);
   for (auto const &key : keys) {
@@ -509,11 +547,11 @@ remote_list(send_conn_state &state,
 task<void> remote_zadd(send_conn_state &state, std::string_view key,
                        std::string_view value, uint32_t score) {
   auto body_size = key.size() + value.size() + sizeof(uint32_t) * 3;
-  auto header_body = std::vector<char>(kRPCRequestHeaderSize + body_size);
-  *reinterpret_cast<method *>(&header_body[sizeof(uint64_t)]) = method::zadd;
-  *reinterpret_cast<uint32_t *>(&header_body[0] + sizeof(uint64_t) +
+  auto header_body = new char[kRPCRequestHeaderSize + body_size];
+  *reinterpret_cast<method *>(header_body + sizeof(uint64_t)) = method::zadd;
+  *reinterpret_cast<uint32_t *>(header_body + sizeof(uint64_t) +
                                 sizeof(method)) = body_size;
-  auto body_p = &header_body[0] + kRPCRequestHeaderSize;
+  auto body_p = header_body + kRPCRequestHeaderSize;
   *reinterpret_cast<uint32_t *>(body_p) = key.size();
   body_p += sizeof(uint32_t);
   std::copy_n(key.data(), key.size(), body_p);
@@ -530,11 +568,11 @@ task<std::optional<std::pair<std::vector<char>, std::vector<score_value_view>>>>
 remote_zrange(send_conn_state &state, std::string_view key, uint32_t min_score,
               uint32_t max_score) {
   auto body_size = sizeof(uint32_t) * 3 + key.size();
-  auto header_body = std::vector<char>(kRPCRequestHeaderSize + body_size);
-  *reinterpret_cast<method *>(&header_body[sizeof(uint64_t)]) = method::zrange;
-  *reinterpret_cast<uint32_t *>(&header_body[0] + sizeof(uint64_t) +
+  auto header_body = new char[kRPCRequestHeaderSize + body_size];
+  *reinterpret_cast<method *>(header_body + sizeof(uint64_t)) = method::zrange;
+  *reinterpret_cast<uint32_t *>(header_body + sizeof(uint64_t) +
                                 sizeof(method)) = body_size;
-  auto body_p = &header_body[0] + kRPCRequestHeaderSize;
+  auto body_p = header_body + kRPCRequestHeaderSize;
   *reinterpret_cast<uint32_t *>(body_p) = key.size();
   body_p += sizeof(uint32_t);
   std::copy_n(key.data(), key.size(), body_p);
@@ -566,11 +604,11 @@ remote_zrange(send_conn_state &state, std::string_view key, uint32_t min_score,
 task<void> remote_zrmv(send_conn_state &state, std::string_view key,
                        std::string_view value) {
   auto body_size = key.size() + value.size() + sizeof(uint32_t) * 2;
-  auto header_body = std::vector<char>(kRPCRequestHeaderSize + body_size);
-  *reinterpret_cast<method *>(&header_body[sizeof(uint64_t)]) = method::zrmv;
-  *reinterpret_cast<uint32_t *>(&header_body[0] + sizeof(uint64_t) +
+  auto header_body = new char[kRPCRequestHeaderSize + body_size];
+  *reinterpret_cast<method *>(header_body + sizeof(uint64_t)) = method::zrmv;
+  *reinterpret_cast<uint32_t *>(header_body + sizeof(uint64_t) +
                                 sizeof(method)) = body_size;
-  auto body_p = &header_body[0] + kRPCRequestHeaderSize;
+  auto body_p = header_body + kRPCRequestHeaderSize;
   *reinterpret_cast<uint32_t *>(body_p) = key.size();
   body_p += sizeof(uint32_t);
   std::copy_n(key.data(), key.size(), body_p);
@@ -581,7 +619,7 @@ task<void> remote_zrmv(send_conn_state &state, std::string_view key,
   co_await rpc_call(state, header_body, kRPCRequestHeaderSize + body_size);
 }
 
-task<void> rpc_reply_recv_loop(uringpp::socket &rpc_conn) {
+task<void> rpc_reply_recv_loop(fstackco::tcp_connection &rpc_conn) {
   io_buffer response(65536);
   int state = kStateRecvHeader;
   size_t rep_size = 0;
@@ -610,8 +648,8 @@ task<void> rpc_reply_recv_loop(uringpp::socket &rpc_conn) {
     }
     if (state != kStateProcess) {
       assert(response.writable() > 0);
-      auto n = co_await rpc_conn.recv(response.write_data(),
-                                      response.writable(), MSG_NOSIGNAL);
+      auto n =
+          co_await rpc_conn.read(response.write_data(), response.writable());
       if (n <= 0) {
         if (n < 0) {
           fmt::print("recv error: {}\n", strerror(-n));
@@ -633,45 +671,30 @@ task<void> rpc_reply_recv_loop(uringpp::socket &rpc_conn) {
   }
 }
 
-task<void> connect_rpc_client(std::string port);
+task<void> connect_rpc_client(uint16_t port);
 
-task<void> rpc_server(std::shared_ptr<loop_with_queue> loop, std::string port) {
+task<void> rpc_server() {
   size_t rpc_conn_id = 0;
-  auto listener = uringpp::listener::listen(loop, "0.0.0.0", port);
+  auto listener = fstackco::tcp_listener(main_loop, 58080);
   fmt::print("Starting RPC server\n");
-  connect_rpc_client(port).detach();
+  connect_rpc_client(58080).detach();
   while (true) {
-    auto [addr, conn] =
-        co_await listener.accept(rpc_loops[rpc_conn_id % rpc_loops.size()]);
-    {
-      int flags = 1;
-      setsockopt(conn.fd(), SOL_TCP, TCP_NODELAY, (void *)&flags,
-                 sizeof(flags));
+    auto conns = co_await listener.accept();
+    for (auto &&conn : conns) {
+      fmt::print("New RPC connection {}\n", rpc_conn_id);
+      conn.set_loop(rpc_loops[rpc_conn_id % rpc_loops.size()]);
+      handle_rpc(std::move(conn), rpc_conn_id);
+      rpc_conn_id++;
     }
-    handle_rpc(std::move(conn), rpc_conn_id++).detach();
   }
   co_return;
 }
 
-task<void> send_all(uringpp::socket &conn, const char *data, size_t size) {
-  while (size > 0) {
-    auto n = co_await conn.send(data, size, MSG_NOSIGNAL);
-    if (n <= 0) {
-      if (n < 0) {
-        fmt::print("send error: {}\n", strerror(-n));
-      }
-      fmt::print("send loop exit\n");
-      co_return;
-    }
-    data += n;
-    size -= n;
-  }
-}
-
-task<void> handle_http(uringpp::socket conn, size_t conn_id) {
+task<void> handle_http_connection(fstackco::tcp_connection conn,
+                                  size_t conn_id) {
   auto conn_shard = conn_id % loops.size();
   auto loop = loops[conn_shard];
-  co_await loop->switch_to_io_thread();
+  co_await io_queues[conn_shard].queue_in_loop(event_fds[conn_shard]);
   try {
     io_buffer request(65536);
     int read_idx = 0;
@@ -704,7 +727,8 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
               request.read_data(), request.readable(), &method, &method_len,
               &path, &path_len, &minor_version, headers, &num_headers, 0);
           if (parser_rc == -1) {
-            co_await send_all(conn, HTTP_400, sizeof(HTTP_400) - 1);
+            send_all(conn, sending, closed, send_buf, pending_send_buf,
+                     HTTP_400, sizeof(HTTP_400) - 1);
             break;
           } else if (parser_rc > 0) {
             path_offset = path - request.read_data();
@@ -737,8 +761,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
 
       if (parser_rc == -2 || receiving_body || request.readable() == 0) {
         assert(request.writable() > 0);
-        n = co_await conn.recv(request.write_data(), request.writable(),
-                               MSG_NOSIGNAL);
+        n = co_await conn.read(request.write_data(), request.writable());
         if (n <= 0) {
           co_return;
         }
@@ -750,15 +773,17 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
       case 'G': {
         switch (path[1]) {
         default: {
-          co_await send_all(conn, OK_RESPONSE, sizeof(OK_RESPONSE) - 1);
+          send_all(conn, sending, closed, send_buf, pending_send_buf,
+                   OK_RESPONSE, sizeof(OK_RESPONSE) - 1);
         } break;
         case 'i': {
           // init
           if (store->kv_loaded()) {
-            co_await send_all(conn, OK_RESPONSE, sizeof(OK_RESPONSE) - 1);
+            send_all(conn, sending, closed, send_buf, pending_send_buf,
+                     OK_RESPONSE, sizeof(OK_RESPONSE) - 1);
           } else {
-            co_await send_all(conn, LOADING_RESPONSE,
-                              sizeof(LOADING_RESPONSE) - 1);
+            send_all(conn, sending, closed, send_buf, pending_send_buf,
+                     LOADING_RESPONSE, sizeof(LOADING_RESPONSE) - 1);
           }
         } break;
         case 'q': {
@@ -781,10 +806,11 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
             }
           }
           if (!value.first) {
-            co_await send_all(conn, HTTP_404, sizeof(HTTP_404) - 1);
+            send_all(conn, sending, closed, send_buf, pending_send_buf,
+                     HTTP_404, sizeof(HTTP_404) - 1);
           } else {
-            co_await send_text(conn, sending, closed, send_buf,
-                               pending_send_buf, value.first, value.second);
+            send_text(conn, sending, closed, send_buf, pending_send_buf,
+                      value.first, value.second);
           }
         } break;
         case 'd': {
@@ -797,7 +823,8 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
             co_await remote_del(rpc_clients[key_shard][conn_shard].get_conn(),
                                 key);
           }
-          co_await send_all(conn, EMPTY_RESPONSE, sizeof(EMPTY_RESPONSE) - 1);
+          send_all(conn, sending, closed, send_buf, pending_send_buf,
+                   EMPTY_RESPONSE, sizeof(EMPTY_RESPONSE) - 1);
         } break;
         case 'z': {
           // zrmv
@@ -817,14 +844,16 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
             co_await remote_zrmv(rpc_clients[key_shard][conn_shard].get_conn(),
                                  key, value);
           }
-          co_await send_all(conn, EMPTY_RESPONSE, sizeof(EMPTY_RESPONSE) - 1);
+          send_all(conn, sending, closed, send_buf, pending_send_buf,
+                   EMPTY_RESPONSE, sizeof(EMPTY_RESPONSE) - 1);
         } break;
         }
       } break;
       case 'P': {
         switch (path[1]) {
         default: {
-          co_await send_all(conn, HTTP_404, sizeof(HTTP_404) - 1);
+          send_all(conn, sending, closed, send_buf, pending_send_buf, HTTP_404,
+                   sizeof(HTTP_404) - 1);
         } break;
         case 'u': {
           // updateCluster
@@ -833,15 +862,16 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
           auto doc = parser.parse(padded);
           nr_peers = doc["hosts"].get_array().size();
           me = doc["index"].get_uint64() - 1;
-          auto f = co_await uringpp::file::open(loop, "/data/cluster.json",
-                                                O_CREAT | O_RDWR, 0644);
-          co_await f.write(body_start, content_length, 0);
-          co_await f.close();
+          {
+            std::ofstream ofs("/data/cluster.json");
+            ofs << clusterjson;
+          }
           {
             bool init = false;
             if (peers_updated.compare_exchange_strong(init, true)) {
-              co_await connect_rpc_client("58080");
-              co_await loop->switch_to_io_thread();
+              co_await connect_rpc_client(58080);
+              co_await io_queues[conn_shard].queue_in_loop(
+                  event_fds[conn_shard]);
               fmt::print("RPC client connected\n");
             }
           }
@@ -855,7 +885,8 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
               init_thread.detach();
             }
           }
-          co_await send_all(conn, OK_RESPONSE, sizeof(OK_RESPONSE) - 1);
+          send_all(conn, sending, closed, send_buf, pending_send_buf,
+                   OK_RESPONSE, sizeof(OK_RESPONSE) - 1);
         } break;
         case 'a': {
           // add
@@ -871,7 +902,8 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
             co_await remote_add(rpc_clients[key_shard][conn_shard].get_conn(),
                                 key, value);
           }
-          co_await send_all(conn, EMPTY_RESPONSE, sizeof(EMPTY_RESPONSE) - 1);
+          send_all(conn, sending, closed, send_buf, pending_send_buf,
+                   EMPTY_RESPONSE, sizeof(EMPTY_RESPONSE) - 1);
         } break;
         case 'b': {
           // batch
@@ -902,7 +934,8 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
           for (auto &&task : tasks) {
             co_await task;
           }
-          co_await send_all(conn, EMPTY_RESPONSE, sizeof(EMPTY_RESPONSE) - 1);
+          send_all(conn, sending, closed, send_buf, pending_send_buf,
+                   EMPTY_RESPONSE, sizeof(EMPTY_RESPONSE) - 1);
         } break;
         case 'l': {
           // list
@@ -942,9 +975,10 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
             remote_key_values.emplace_back(std::move(remote_kvs.second));
           }
           if (local_key_values.empty() && remote_kv_count == 0) {
-            co_await send_all(conn, HTTP_404, sizeof(HTTP_404) - 1);
+            send_all(conn, sending, closed, send_buf, pending_send_buf,
+                     HTTP_404, sizeof(HTTP_404) - 1);
           } else {
-            rapidjson::StringBuffer buffer;
+            json_output_stream stream;
             {
               auto d = rapidjson::Document();
               auto &kv_list = d.SetArray();
@@ -969,10 +1003,11 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
                   write_kv(kv.key, kv.value);
                 }
               }
-              rapidjson::Writer writer(buffer);
+              rapidjson::Writer<json_output_stream> writer(stream);
               d.Accept(writer);
             }
-            co_await send_json(conn, buffer);
+            send_json(conn, sending, closed, send_buf, pending_send_buf,
+                      stream);
           }
         } break;
         case 'z': {
@@ -993,7 +1028,8 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
                   rpc_clients[key_shard][conn_shard].get_conn(), key, value,
                   score);
             }
-            co_await send_all(conn, EMPTY_RESPONSE, sizeof(EMPTY_RESPONSE) - 1);
+            send_all(conn, sending, closed, send_buf, pending_send_buf,
+                     EMPTY_RESPONSE, sizeof(EMPTY_RESPONSE) - 1);
           } break;
           case 'r': {
             // zrange
@@ -1004,7 +1040,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
             auto min_score = score_range["min_score"].get_uint64().take_value();
             auto max_score = score_range["max_score"].get_uint64().take_value();
             auto key_shard = get_shard(key);
-            rapidjson::StringBuffer buffer;
+            json_output_stream stream;
             auto d = rapidjson::Document();
             auto &sv_list = d.SetArray();
             auto &allocator = d.GetAllocator();
@@ -1018,28 +1054,32 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
             if (key_shard == me) {
               auto score_values = store->zrange(key, min_score, max_score);
               if (!score_values.has_value()) {
-                co_await send_all(conn, HTTP_404, sizeof(HTTP_404) - 1);
+                send_all(conn, sending, closed, send_buf, pending_send_buf,
+                         HTTP_404, sizeof(HTTP_404) - 1);
               } else {
                 for (auto &sv : score_values.value()) {
                   write_sv(sv.value, sv.score);
                 }
-                rapidjson::Writer writer(buffer);
+                rapidjson::Writer<json_output_stream> writer(stream);
                 d.Accept(writer);
-                co_await send_json(conn, buffer);
+                send_json(conn, sending, closed, send_buf, pending_send_buf,
+                          stream);
               }
             } else {
               auto score_values = co_await remote_zrange(
                   rpc_clients[key_shard][conn_shard].get_conn(), key, min_score,
                   max_score);
               if (!score_values.has_value()) {
-                co_await send_all(conn, HTTP_404, sizeof(HTTP_404) - 1);
+                send_all(conn, sending, closed, send_buf, pending_send_buf,
+                         HTTP_404, sizeof(HTTP_404) - 1);
               } else {
                 for (auto &sv : score_values.value().second) {
                   write_sv(sv.value, sv.score);
                 }
-                rapidjson::Writer writer(buffer);
+                rapidjson::Writer<json_output_stream> writer(stream);
                 d.Accept(writer);
-                co_await send_json(conn, buffer);
+                send_json(conn, sending, closed, send_buf, pending_send_buf,
+                          stream);
               }
             }
           } break;
@@ -1048,7 +1088,8 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
         }
       } break;
       default:
-        co_await send_all(conn, OK_RESPONSE, sizeof(OK_RESPONSE) - 1);
+        send_all(conn, sending, closed, send_buf, pending_send_buf, OK_RESPONSE,
+                 sizeof(OK_RESPONSE) - 1);
       }
       request.advance_read(parser_rc + content_length);
       content_length = 0;
@@ -1057,187 +1098,28 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
       parser_rc = -2;
     }
   } catch (std::exception &e) {
-    fmt::print("conn {} error {}\n", conn.fd(), e.what());
+    fmt::print("conn {} error {}\n", conn.fd().fd(), e.what());
   }
 
   co_return;
 }
 
-task<void> http_server(std::shared_ptr<loop_with_queue> loop) {
-  auto listener = uringpp::listener::listen(loop, "0.0.0.0", "8080");
+task<void> http_server() {
   size_t conn_id = 0;
-  fmt::print("Starting HTTP server\n");
-  while (true) {
-    try {
-      auto [addr, conn] =
-          co_await listener.accept(loops[conn_id % loops.size()]);
-      {
-        int flags = 1;
-        setsockopt(conn.fd(), SOL_TCP, TCP_NODELAY, (void *)&flags,
-                   sizeof(flags));
-      }
-      handle_http(std::move(conn), conn_id).detach();
+  auto listener = fstackco::tcp_listener(main_loop, 8080);
+  for (;;) {
+    auto conns = co_await listener.accept();
+    for (auto &&conn : conns) {
+      conn.set_loop(loops[conn_id % loops.size()]);
+      handle_http_connection(std::move(conn), conn_id).detach();
       conn_id++;
-    } catch (std::exception &e) {
-      fmt::print("Failed to accept {}\n", e.what());
     }
-  }
-}
-
-task<void> connect_rpc_client(std::string port) {
-  (void)loop_started.load();
-  const size_t num_conns_per_shard = 4;
-  try {
-    co_await main_loop->switch_to_io_thread();
-    fmt::print("Starting RPC client\n");
-    auto f = co_await uringpp::file::open(main_loop, "/data/cluster.json",
-                                          O_RDONLY, 0644);
-    std::vector<char> buf;
-    while (true) {
-      std::array<char, 4096> read_buf;
-      auto rc = co_await f.read(&read_buf[0], read_buf.size(), buf.size());
-      if (rc <= 0) {
-        break;
-      }
-      buf.insert(buf.end(), read_buf.begin(), read_buf.begin() + rc);
-    }
-    simdjson::dom::parser parser;
-    simdjson::padded_string json =
-        simdjson::padded_string(buf.data(), buf.size());
-    auto doc = parser.parse(json);
-    auto hosts = doc["hosts"].get_array().take_value();
-    me = doc["index"].get_uint64().take_value() - 1;
-    nr_peers = hosts.size();
-    for (auto &&host : hosts) {
-      peer_hosts.emplace_back(host.get_string().take_value());
-    }
-    rpc_clients.resize(hosts.size());
-    peers_updated = true;
-    for (int i = 0; i < loops.size(); i++) {
-      auto loop = loops[i];
-      co_await loop->switch_to_io_thread();
-      for (size_t peer_idx = 0; peer_idx < nr_peers; ++peer_idx) {
-        if (peer_idx == me) {
-          continue;
-        }
-        auto const &host = peer_hosts[peer_idx];
-        fmt::print("Connecting to {}:{}\n", host, port);
-        rpc_clients[peer_idx].resize(loops.size());
-        rpc_clients[peer_idx][i].conns.resize(num_conns_per_shard);
-        for (int c = 0; c < num_conns_per_shard; c++) {
-          while (true) {
-            try {
-              auto rpc_conn =
-                  co_await uringpp::socket::connect(loop, host, port);
-              {
-                int flags = 1;
-                setsockopt(rpc_conn.fd(), SOL_TCP, TCP_NODELAY, (void *)&flags,
-                           sizeof(flags));
-              }
-              auto state = send_conn_state{
-                  std::make_unique<uringpp::socket>(std::move(rpc_conn)),
-                  {},
-                  {},
-                  false,
-                  false};
-              rpc_clients[peer_idx][i].conns[c] = std::move(state);
-              rpc_reply_recv_loop(*rpc_clients[peer_idx][i].conns[c].conn)
-                  .detach();
-              fmt::print("Connected to peer {} on loop {}\n", host, i);
-              break;
-            } catch (...) {
-              // ...
-            }
-            struct __kernel_timespec ts;
-            ts.tv_sec = 0;
-            ts.tv_nsec = 1000000;
-            co_await loop->timeout(&ts);
-          }
-        }
-      }
-    }
-    rpc_connected = true;
-  } catch (std::exception &e) {
-    fmt::print("Failed to connect to peers {}\n", e.what());
-    peers_updated = false;
-    co_return;
   }
 }
 
 int main(int argc, char *argv[]) {
-  main_loop = loop_with_queue::create(32768);
-  main_loop->waker().detach();
-  ::signal(SIGPIPE, SIG_IGN);
-  cores = get_cpu_affinity();
-  loops.resize(cores.size());
-  rpc_loops.resize(cores.size());
-  cds::Initialize();
-  cds::gc::HP hpGC;
-  store = std::make_unique<storage>();
-  {
-    auto kv_thread = std::jthread([]() {
-      cds::threading::Manager::attachThread();
-      store->load_kv();
-      cds::threading::Manager::detachThread();
-    });
-    auto zset_thread = std::jthread([]() {
-      cds::threading::Manager::attachThread();
-      store->load_zset();
-      cds::threading::Manager::detachThread();
-    });
-  }
-  auto flush_thread = std::thread([]() {
-    for (;;) {
-      store->flush();
-      std::this_thread::sleep_for(std::chrono::milliseconds(500));
-    }
-  });
-  flush_thread.detach();
-  bind_cpu(cores[0]);
-  for (int i = 0; i < cores.size(); ++i) {
-    auto thread = std::thread([i, core = cores[i]] {
-      fmt::print("thread {} bind to core {}\n", i, core);
-      bind_cpu(core);
-      cds::threading::Manager::attachThread();
-      auto loop = loop_with_queue::create(32768, IORING_SETUP_ATTACH_WQ,
-                                          main_loop->fd());
-      loops[i] = loop;
-      loop_started.fetch_add(1);
-      loop->waker().detach();
-      for (;;) {
-        loop->poll();
-      }
-    });
-    thread.detach();
-  }
-  while (loop_started.load() != cores.size()) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-  }
-  loop_started = 0;
-  for (int i = 0; i < cores.size(); ++i) {
-    auto thread = std::thread([i, core = cores[i]] {
-      fmt::print("RPC Thread {} bind to core {}\n", i, core);
-      bind_cpu(core);
-      cds::threading::Manager::attachThread();
-      auto loop = loop_with_queue::create(32768, IORING_SETUP_ATTACH_WQ,
-                                          main_loop->fd());
-      rpc_loops[i] = loop;
-      loop_started.fetch_add(1);
-      loop->waker().detach();
-      for (;;) {
-        loop->poll();
-      }
-    });
-    thread.detach();
-  }
-  while (loop_started.load() != cores.size()) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-  }
-  rpc_server(main_loop, "58080").detach();
-  http_server(main_loop).detach();
-  for (;;) {
-    main_loop->poll();
-  }
-  cds::Terminate();
+  fstackco::init(argc, argv);
+  main_loop = std::make_shared<fstackco::event_loop>();
+  main_loop->loop();
   return 0;
 }

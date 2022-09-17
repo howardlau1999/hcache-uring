@@ -41,8 +41,6 @@ storage::storage() : kv_initialized_(false), kv_initializing_(false) {
   zset_db_ = std::unique_ptr<rocksdb::DB>(db);
 }
 
-task<void> storage::start_rpc_server() { co_return; }
-
 void storage::open_kv_db() {
   fmt::print("Opening KV DB {}\n", kv_dir);
   rocksdb::DB *db;
@@ -176,30 +174,6 @@ void storage::load_zset() {
     count++;
   }
   fmt::print("Loaded {} ZSET keys\n", count);
-}
-
-task<void> storage::try_update_peer() {
-  // if (!co_await seastar::file_exists("/data/cluster.json")) {
-  //   co_return;
-  // }
-  // bool updated = false;
-  // if (peers_updated_.compare_exchange_strong(updated, true)) {
-  //   fmt::print("Updating peer info");
-  //   auto f = co_await seastar::open_file_dma("/data/cluster.json",
-  //                                            seastar::open_flags::ro);
-  //   auto size = co_await f.size();
-  //   auto stream = seastar::make_file_input_stream(std::move(f));
-  //   auto buf = co_await stream.read_exactly(size);
-  //   co_await stream.close();
-  //   simdjson::dom::parser parser;
-  //   simdjson::padded_string_view json =
-  //       simdjson::padded_string_view(buf.begin(), buf.size());
-  //   auto document = parser.parse(json);
-  //   auto hosts = document["hosts"].get_array().take_value();
-  //   auto index = document["index"].get_uint64().take_value();
-  //   co_await update_peers(std::move(hosts), index);
-  // }
-  co_return;
 }
 
 size_t storage::get_key_shard(std::string_view key) const {

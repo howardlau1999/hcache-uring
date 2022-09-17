@@ -19,3 +19,6 @@
 [submodule "third_party/mimalloc"]
 	path = third_party/mimalloc
 	url = https://github.com/microsoft/mimalloc
+[submodule "third_party/f-stack-co"]
+	path = third_party/f-stack-co
+	url = https://github.com/howardlau1999/f-stack-co

@@ -11,7 +11,7 @@ void bind_cpu(int core);
 
 std::vector<int> get_cpu_affinity();
 
-void enable_on_cores(std::vector<int> const& cores) ;
+void enable_on_cores(std::vector<int> const &cores);
 
 class io_queue {
   boost::lockfree::queue<std::coroutine_handle<>,
@@ -22,7 +22,8 @@ public:
   struct thread_switch_awaitable {
     io_queue &queue_;
     int efd_;
-    thread_switch_awaitable(io_queue &queue, int efd) : queue_(queue), efd_(efd) {}
+    thread_switch_awaitable(io_queue &queue, int efd)
+        : queue_(queue), efd_(efd) {}
     bool await_ready() const noexcept { return false; }
     void await_suspend(std::coroutine_handle<> h) const noexcept {
       queue_.push(h);
@@ -49,10 +50,12 @@ class loop_with_queue : public uringpp::event_loop {
 
 public:
   static std::shared_ptr<loop_with_queue>
-  create(unsigned int entries = 128, uint32_t flags = 0, int wq_fd = -1);
+  create(unsigned int entries = 128, uint32_t flags = 0, int wq_fd = -1,
+         int sq_thread_cpu = -1, int sq_thread_idle = 2000);
 
   loop_with_queue(unsigned int entries = 128, uint32_t flags = 0,
-                  int wq_fd = -1);
+                  int wq_fd = -1, int sq_thread_cpu = -1,
+                  int sq_thread_idle = 2000);
 
   template <class T> void block_on(uringpp::task<T> t) {
     while (!t.h_.done()) {

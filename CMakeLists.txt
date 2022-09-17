@@ -46,17 +46,37 @@ add_subdirectory(third_party/uringpp)
 add_subdirectory(third_party/fmt)
 add_subdirectory(third_party/mimalloc)
 add_subdirectory(third_party/simdjson)
+add_subdirectory(third_party/f-stack-co)
 set(BUILD_EXAMPLES OFF)
 set(BUILD_TESTING OFF)
 include_directories(third_party/rapidjson/include)
 include_directories(third_party/uringpp/include)
+include_directories(third_party/f-stack-co/include)
 include_directories(include)
 
-add_executable(hcache src/storage.cc src/hcache.cc src/threading.cc src/picohttpparser.c)
+add_library(hcache-common src/storage.cc src/threading.cc src/picohttpparser.c)
+target_link_libraries(hcache-common 
+  PUBLIC        
+    rocksdb
+    cds-s
+    ZLIB::ZLIB
+    zstd
+    Boost::boost
+    Threads::Threads
+    snappy
+    lz4
+    fmt::fmt
+    mimalloc-static
+    simdjson
+    xxhash
+)
+
+add_executable(hcache src/hcache.cc)
 add_dependencies(hcache rocksdb_src)
 target_link_libraries(hcache 
   PRIVATE        
     rocksdb
+    hcache-common
     cds-s
     ZLIB::ZLIB
     zstd
@@ -69,6 +89,27 @@ target_link_libraries(hcache
     mimalloc-static
     simdjson
     xxhash
+)
+
+add_executable(hcache-dpdk src/hcache-dpdk.cc)
+add_dependencies(hcache-dpdk rocksdb_src)
+target_link_libraries(hcache-dpdk 
+  PRIVATE        
+    rocksdb
+    hcache-common
+    cds-s
+    ZLIB::ZLIB
+    zstd
+    Boost::boost
+    Threads::Threads
+    snappy
+    lz4
+    fmt::fmt
+    mimalloc-static
+    simdjson
+    xxhash
+    fstackco
+    uring
 )
 
 add_executable(pingpong src/pingpong.cc src/threading.cc)

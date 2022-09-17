@@ -3,8 +3,8 @@
 #include "rocksdb/options.h"
 #include "rpc.h"
 #include "uringpp/task.h"
-#include <algorithm>
 #include "xxhash.h"
+#include <algorithm>
 #include <boost/multi_index/hashed_index.hpp>
 #include <boost/multi_index/member.hpp>
 #include <boost/multi_index_container.hpp>
@@ -78,8 +78,6 @@ using unordered_string_set = multi_index_container<
 size_t get_shard(std::string_view key);
 extern size_t nr_peers;
 extern size_t me;
-
-using uringpp::task;
 
 struct key_value_intl
     : public cds::intrusive::cuckoo::node<cds::intrusive::cuckoo::list, 2> {
@@ -196,6 +194,7 @@ class storage {
 
   void open_kv_db();
   size_t get_key_shard(std::string_view key) const;
+
 public:
   storage();
 
@@ -204,8 +203,6 @@ public:
   void load_kv();
   void load_zset();
   bool kv_loaded() const { return kv_initialized_; }
-
-  task<void> start_rpc_server();
 
   std::vector<key_view_value>
   list(std::unordered_set<std::string_view>::iterator begin,
@@ -219,8 +216,9 @@ public:
     return ret;
   }
 
-  std::vector<key_view_value> list(std::vector<std::string_view>::iterator begin,
-                              std::vector<std::string_view>::iterator end) {
+  std::vector<key_view_value>
+  list(std::vector<std::string_view>::iterator begin,
+       std::vector<std::string_view>::iterator end) {
     std::vector<key_view_value> ret;
     for (auto it = begin; it != end; ++it) {
       if (auto v = query(*it); v.first) {
@@ -230,40 +228,19 @@ public:
     return ret;
   }
 
-  task<void> try_update_peer();
-
   std::pair<char *, size_t> query(std::string_view key);
-  task<std::optional<std::string>> remote_query(size_t shard,
-                                                std::string_view key);
-
-  task<std::vector<key_value>>
-  remote_list(size_t shard, std::unordered_set<std::string_view> &&keys);
-
-  task<void> remote_batch(size_t shared, std::vector<key_value_view> &&kvs);
 
   void add_no_persist(std::string_view key, std::string_view value);
   void add(std::string_view key, std::string_view value);
-  task<void> remote_add(size_t shard, std::string_view key,
-                        std::string_view value);
-
   void del(std::string_view key);
-  task<void> remote_del(size_t shard, std::string_view key);
-
   void zadd_no_persist(std::string_view key, std::string_view value,
                        uint32_t score);
   void zadd(std::string_view key, std::string_view value, uint32_t score);
-  task<void> remote_zadd(size_t shard, std::string_view key,
-                         std::string_view value, uint32_t score);
 
   void zrmv(std::string_view key, std::string_view value);
-  task<void> remote_zrmv(size_t shard, std::string_view key,
-                         std::string_view value);
 
   std::optional<std::vector<score_value>>
   zrange(std::string_view key, uint32_t min_score, uint32_t max_score);
-  task<std::optional<std::vector<score_value>>>
-  remote_zrange(size_t shard, std::string_view key, uint32_t min_score,
-                uint32_t max_score);
 
   static std::vector<char> encode_zset_key(std::string_view key,
                                            std::string_view value) {
