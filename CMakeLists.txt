@@ -66,8 +66,8 @@ target_link_libraries(hcache-common
     snappy
     lz4
     fmt::fmt
-    mimalloc-static
     simdjson
+    uringpp
     xxhash
 )
 
@@ -86,30 +86,8 @@ target_link_libraries(hcache
     lz4
     uringpp
     fmt::fmt
-    mimalloc-static
     simdjson
     xxhash
-)
-
-add_executable(hcache-dpdk src/hcache-dpdk.cc)
-add_dependencies(hcache-dpdk rocksdb_src)
-target_link_libraries(hcache-dpdk 
-  PRIVATE        
-    rocksdb
-    hcache-common
-    cds-s
-    ZLIB::ZLIB
-    zstd
-    Boost::boost
-    Threads::Threads
-    snappy
-    lz4
-    fmt::fmt
-    mimalloc-static
-    simdjson
-    xxhash
-    fstackco
-    uring
 )
 
 add_executable(pingpong src/pingpong.cc src/threading.cc)
