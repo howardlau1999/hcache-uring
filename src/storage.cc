@@ -26,6 +26,8 @@ static inline rocksdb::Options get_open_options() {
   options.allow_mmap_writes = true;
   options.use_adaptive_mutex = true;
   options.unordered_write = true;
+  options.enable_write_thread_adaptive_yield = true;
+  options.write_buffer_size = 256 * 1024 * 1024;
   options.DisableExtraChecks();
   options.IncreaseParallelism(4);
   return options;
