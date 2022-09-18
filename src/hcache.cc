@@ -38,6 +38,11 @@
 
 using uringpp::task;
 
+template <size_t align> constexpr size_t align_up(const uint64_t size) {
+  static_assert((align & (align - 1)) == 0, "align must be power of 2");
+  return (size + align - 1) & ~(align - 1);
+}
+
 struct send_conn_state {
   std::unique_ptr<uringpp::socket> conn;
   std::list<output_page> send_buf;
@@ -290,13 +295,15 @@ task<void> handle_rpc(uringpp::socket conn, size_t conn_id) {
     switch (m) {
     case method::query: {
       uint32_t key_size = *reinterpret_cast<uint32_t *>(req_p);
+      uint32_t key_size_align = align_up<sizeof(uint32_t)>(key_size);
       req_p += sizeof(key_size);
       std::string_view key(req_p, key_size);
-      req_p += key_size;
+      req_p += key_size_align;
       auto value = store->query(key);
       if (value.first) {
-        auto size_u32 = static_cast<uint32_t>(value.second);
-        auto rep_body_size = value.second + sizeof(size_u32);
+        uint32_t size_u32 = static_cast<uint32_t>(value.second);
+        auto rep_body_size =
+            align_up<sizeof(uint32_t)>(value.second) + sizeof(size_u32);
         auto rep_body = std::vector<char>(rep_body_size);
         std::copy_n(reinterpret_cast<char *>(&size_u32), sizeof(size_u32),
                     rep_body.begin());
@@ -309,13 +316,15 @@ task<void> handle_rpc(uringpp::socket conn, size_t conn_id) {
     } break;
     case method::add: {
       uint32_t key_size = *reinterpret_cast<uint32_t *>(req_p);
+      uint32_t key_size_align = align_up<sizeof(uint32_t)>(key_size);
       req_p += sizeof(key_size);
       std::string_view key(req_p, key_size);
-      req_p += key_size;
+      req_p += key_size_align;
       uint32_t value_size = *reinterpret_cast<uint32_t *>(req_p);
+      uint32_t value_size_align = align_up<sizeof(uint32_t)>(value_size);
       req_p += sizeof(value_size);
       std::string_view value(req_p, value_size);
-      req_p += value_size;
+      req_p += value_size_align;
       store->add(key, value);
       co_await rpc_reply(conn, req_id, {});
     } break;
@@ -333,29 +342,35 @@ task<void> handle_rpc(uringpp::socket conn, size_t conn_id) {
       std::vector<std::string_view> keys;
       for (uint32_t i = 0; i < key_count; i++) {
         uint32_t key_size = *reinterpret_cast<uint32_t *>(req_p);
+        uint32_t key_size_align = align_up<sizeof(uint32_t)>(key_size);
         req_p += sizeof(key_size);
         std::string_view key(req_p, key_size);
-        req_p += key_size;
+        req_p += key_size_align;
         keys.push_back(key);
       }
       auto values = store->list(keys.begin(), keys.end());
       size_t rep_body_size = sizeof(uint32_t);
       for (auto &v : values) {
-        rep_body_size += sizeof(uint32_t) * 2 + v.key.size() + v.value.size();
+        rep_body_size += sizeof(uint32_t) * 2 +
+                         align_up<sizeof(uint32_t)>(v.key.size()) +
+                         align_up<sizeof(uint32_t)>(v.value.size());
       }
+      assert(rep_body_size % sizeof(uint32_t) == 0);
       auto rep_body = std::vector<char>(rep_body_size);
       auto p = &rep_body[0];
       *reinterpret_cast<uint32_t *>(p) = values.size();
       p += sizeof(uint32_t);
       for (auto &v : values) {
         *reinterpret_cast<uint32_t *>(p) = v.key.size();
+        uint32_t key_size_align = align_up<sizeof(uint32_t)>(v.key.size());
         p += sizeof(uint32_t);
         std::copy_n(v.key.data(), v.key.size(), p);
-        p += v.key.size();
+        p += key_size_align;
         *reinterpret_cast<uint32_t *>(p) = v.value.size();
+        uint32_t value_size_align = align_up<sizeof(uint32_t)>(v.value.size());
         p += sizeof(uint32_t);
         std::copy_n(v.value.data(), v.value.size(), p);
-        p += v.value.size();
+        p += value_size_align;
       }
       co_await rpc_reply(conn, req_id, std::move(rep_body));
     } break;
@@ -364,26 +379,30 @@ task<void> handle_rpc(uringpp::socket conn, size_t conn_id) {
       req_p += sizeof(count);
       for (uint32_t i = 0; i < count; i++) {
         uint32_t key_size = *reinterpret_cast<uint32_t *>(req_p);
+        uint32_t key_size_align = align_up<sizeof(uint32_t)>(key_size);
         req_p += sizeof(key_size);
         std::string_view key(req_p, key_size);
-        req_p += key_size;
+        req_p += key_size_align;
         uint32_t value_size = *reinterpret_cast<uint32_t *>(req_p);
+        uint32_t value_size_align = align_up<sizeof(uint32_t)>(value_size);
         req_p += sizeof(value_size);
         std::string_view value(req_p, value_size);
-        req_p += value_size;
+        req_p += value_size_align;
         store->add(key, value);
       }
       co_await rpc_reply(conn, req_id, {});
     } break;
     case method::zadd: {
       uint32_t key_size = *reinterpret_cast<uint32_t *>(req_p);
+      uint32_t key_size_align = align_up<sizeof(uint32_t)>(key_size);
       req_p += sizeof(key_size);
       std::string_view key(req_p, key_size);
-      req_p += key_size;
+      req_p += key_size_align;
       uint32_t value_size = *reinterpret_cast<uint32_t *>(req_p);
+      uint32_t value_size_align = align_up<sizeof(uint32_t)>(value_size);
       req_p += sizeof(value_size);
       std::string_view value(req_p, value_size);
-      req_p += value_size;
+      req_p += value_size_align;
       uint32_t score = *reinterpret_cast<uint32_t *>(req_p);
       req_p += sizeof(score);
       store->zadd(key, value, score);
@@ -391,21 +410,24 @@ task<void> handle_rpc(uringpp::socket conn, size_t conn_id) {
     } break;
     case method::zrmv: {
       uint32_t key_size = *reinterpret_cast<uint32_t *>(req_p);
+      uint32_t key_size_align = align_up<sizeof(uint32_t)>(key_size);
       req_p += sizeof(key_size);
       std::string_view key(req_p, key_size);
-      req_p += key_size;
+      req_p += key_size_align;
       uint32_t value_size = *reinterpret_cast<uint32_t *>(req_p);
+      uint32_t value_size_align = align_up<sizeof(uint32_t)>(value_size);
       req_p += sizeof(value_size);
       std::string_view value(req_p, value_size);
-      req_p += value_size;
+      req_p += value_size_align;
       store->zrmv(key, value);
       co_await rpc_reply(conn, req_id, {});
     } break;
     case method::zrange: {
       uint32_t key_size = *reinterpret_cast<uint32_t *>(req_p);
+      uint32_t key_size_align = align_up<sizeof(uint32_t)>(key_size);
       req_p += sizeof(key_size);
       std::string_view key(req_p, key_size);
-      req_p += key_size;
+      req_p += key_size_align;
       uint32_t min_score = *reinterpret_cast<uint32_t *>(req_p);
       req_p += sizeof(min_score);
       uint32_t max_score = *reinterpret_cast<uint32_t *>(req_p);
@@ -417,7 +439,8 @@ task<void> handle_rpc(uringpp::socket conn, size_t conn_id) {
         auto const &score_values = values.value();
         size_t rep_body_size = sizeof(uint32_t);
         for (auto &v : score_values) {
-          rep_body_size += sizeof(uint32_t) * 2 + v.value.size();
+          rep_body_size +=
+              sizeof(uint32_t) * 2 + align_up<sizeof(uint32_t)>(v.value.size());
         }
         auto rep_body = std::vector<char>(rep_body_size);
         auto p = &rep_body[0];
@@ -427,7 +450,7 @@ task<void> handle_rpc(uringpp::socket conn, size_t conn_id) {
           *reinterpret_cast<uint32_t *>(p) = sv.value.size();
           p += sizeof(uint32_t);
           std::copy_n(sv.value.data(), sv.value.size(), p);
-          p += sv.value.size();
+          p += align_up<sizeof(uint32_t)>(sv.value.size());
           *reinterpret_cast<uint32_t *>(p) = sv.score;
           p += sizeof(uint32_t);
         }
@@ -470,7 +493,7 @@ task<std::vector<char>> rpc_call(conn_pool &pool, std::vector<char> body,
 
 task<std::optional<std::pair<std::vector<char>, std::string_view>>>
 remote_query(conn_pool &pool, std::string_view key) {
-  auto body_size = key.size() + sizeof(uint32_t);
+  auto body_size = align_up<sizeof(uint32_t)>(key.size()) + sizeof(uint32_t);
   auto header_body = std::vector<char>(kRPCRequestHeaderSize + body_size);
   *reinterpret_cast<method *>(&header_body[sizeof(uint64_t)]) = method::query;
   *reinterpret_cast<uint32_t *>(
@@ -494,7 +517,9 @@ remote_query(conn_pool &pool, std::string_view key) {
 
 task<void> remote_add(conn_pool &pool, std::string_view key,
                       std::string_view value) {
-  auto body_size = key.size() + value.size() + sizeof(uint32_t) * 2;
+  auto key_size_align = align_up<sizeof(uint32_t)>(key.size());
+  auto value_size_align = align_up<sizeof(uint32_t)>(value.size());
+  auto body_size = key_size_align + value_size_align + sizeof(uint32_t) * 2;
   auto header_body = std::vector<char>(kRPCRequestHeaderSize + body_size);
   *reinterpret_cast<method *>(&header_body[sizeof(uint64_t)]) = method::add;
   *reinterpret_cast<uint32_t *>(&header_body[0] + sizeof(uint64_t) +
@@ -503,7 +528,7 @@ task<void> remote_add(conn_pool &pool, std::string_view key,
   *reinterpret_cast<uint32_t *>(body_p) = key.size();
   body_p += sizeof(uint32_t);
   std::copy_n(key.data(), key.size(), body_p);
-  body_p += key.size();
+  body_p += key_size_align;
   *reinterpret_cast<uint32_t *>(body_p) = value.size();
   body_p += sizeof(uint32_t);
   std::copy_n(value.data(), value.size(), body_p);
@@ -512,7 +537,7 @@ task<void> remote_add(conn_pool &pool, std::string_view key,
 }
 
 task<void> remote_del(conn_pool &pool, std::string_view key) {
-  auto body_size = key.size() + sizeof(uint32_t);
+  auto body_size = align_up<sizeof(uint32_t)>(key.size()) + sizeof(uint32_t);
   auto header_body = std::vector<char>(kRPCRequestHeaderSize + body_size);
   *reinterpret_cast<method *>(&header_body[sizeof(uint64_t)]) = method::del;
   *reinterpret_cast<uint32_t *>(&header_body[0] + sizeof(uint64_t) +
@@ -529,7 +554,9 @@ task<void> remote_batch(conn_pool &pool,
                         std::vector<key_value_view> const &kvs) {
   auto body_size = sizeof(uint32_t);
   for (auto const kv : kvs) {
-    body_size += sizeof(uint32_t) * 2 + kv.key.size() + kv.value.size();
+    body_size += sizeof(uint32_t) * 2 +
+                 align_up<sizeof(uint32_t)>(kv.key.size()) +
+                 align_up<sizeof(uint32_t)>(kv.value.size());
   }
   auto header_body = std::vector<char>(kRPCRequestHeaderSize + body_size);
   *reinterpret_cast<method *>(&header_body[sizeof(uint64_t)]) = method::batch;
@@ -542,11 +569,11 @@ task<void> remote_batch(conn_pool &pool,
     *reinterpret_cast<uint32_t *>(body_p) = kv.key.size();
     body_p += sizeof(uint32_t);
     std::copy_n(kv.key.data(), kv.key.size(), body_p);
-    body_p += kv.key.size();
+    body_p += align_up<sizeof(uint32_t)>(kv.key.size());
     *reinterpret_cast<uint32_t *>(body_p) = kv.value.size();
     body_p += sizeof(uint32_t);
     std::copy_n(kv.value.data(), kv.value.size(), body_p);
-    body_p += kv.value.size();
+    body_p += align_up<sizeof(uint32_t)>(kv.value.size());
   }
   co_await rpc_call(pool, std::move(header_body),
                     kRPCRequestHeaderSize + body_size);
@@ -556,7 +583,7 @@ task<std::pair<std::vector<char>, std::vector<key_value_view>>>
 remote_list(conn_pool &pool, std::unordered_set<std::string_view> const &keys) {
   auto body_size = sizeof(uint32_t);
   for (auto const &key : keys) {
-    body_size += sizeof(uint32_t) + key.size();
+    body_size += sizeof(uint32_t) + align_up<sizeof(uint32_t)>(key.size());
   }
   auto header_body = std::vector<char>(kRPCRequestHeaderSize + body_size);
   *reinterpret_cast<method *>(&header_body[sizeof(uint64_t)]) = method::list;
@@ -569,7 +596,7 @@ remote_list(conn_pool &pool, std::unordered_set<std::string_view> const &keys) {
     *reinterpret_cast<uint32_t *>(body_p) = key.size();
     body_p += sizeof(uint32_t);
     std::copy_n(key.data(), key.size(), body_p);
-    body_p += key.size();
+    body_p += align_up<sizeof(uint32_t)>(key.size());
   }
   auto response = co_await rpc_call(pool, std::move(header_body),
                                     kRPCRequestHeaderSize + body_size);
@@ -581,11 +608,11 @@ remote_list(conn_pool &pool, std::unordered_set<std::string_view> const &keys) {
     auto key_size = *reinterpret_cast<uint32_t *>(rep_p);
     rep_p += sizeof(uint32_t);
     auto key = std::string_view(rep_p, key_size);
-    rep_p += key_size;
+    rep_p += align_up<sizeof(uint32_t)>(key_size);
     auto value_size = *reinterpret_cast<uint32_t *>(rep_p);
     rep_p += sizeof(uint32_t);
     auto value = std::string_view(rep_p, value_size);
-    rep_p += value_size;
+    rep_p += align_up<sizeof(uint32_t)>(value_size);
     kvs.emplace_back(key, value);
   }
   co_return {std::move(response), std::move(kvs)};
@@ -593,7 +620,9 @@ remote_list(conn_pool &pool, std::unordered_set<std::string_view> const &keys) {
 
 task<void> remote_zadd(conn_pool &pool, std::string_view key,
                        std::string_view value, uint32_t score) {
-  auto body_size = key.size() + value.size() + sizeof(uint32_t) * 3;
+  uint32_t key_size_align = align_up<sizeof(uint32_t)>(key.size());
+  uint32_t value_size_align = align_up<sizeof(uint32_t)>(value.size());
+  auto body_size = key_size_align + value_size_align + sizeof(uint32_t) * 3;
   auto header_body = std::vector<char>(kRPCRequestHeaderSize + body_size);
   *reinterpret_cast<method *>(&header_body[sizeof(uint64_t)]) = method::zadd;
   *reinterpret_cast<uint32_t *>(&header_body[0] + sizeof(uint64_t) +
@@ -602,11 +631,11 @@ task<void> remote_zadd(conn_pool &pool, std::string_view key,
   *reinterpret_cast<uint32_t *>(body_p) = key.size();
   body_p += sizeof(uint32_t);
   std::copy_n(key.data(), key.size(), body_p);
-  body_p += key.size();
+  body_p += key_size_align;
   *reinterpret_cast<uint32_t *>(body_p) = value.size();
   body_p += sizeof(uint32_t);
   std::copy_n(value.data(), value.size(), body_p);
-  body_p += value.size();
+  body_p += value_size_align;
   *reinterpret_cast<uint32_t *>(body_p) = score;
   co_await rpc_call(pool, std::move(header_body),
                     kRPCRequestHeaderSize + body_size);
@@ -615,7 +644,8 @@ task<void> remote_zadd(conn_pool &pool, std::string_view key,
 task<std::optional<std::pair<std::vector<char>, std::vector<score_value_view>>>>
 remote_zrange(conn_pool &pool, std::string_view key, uint32_t min_score,
               uint32_t max_score) {
-  auto body_size = sizeof(uint32_t) * 3 + key.size();
+  uint32_t key_size_align = align_up<sizeof(uint32_t)>(key.size());
+  auto body_size = sizeof(uint32_t) * 3 + key_size_align;
   auto header_body = std::vector<char>(kRPCRequestHeaderSize + body_size);
   *reinterpret_cast<method *>(&header_body[sizeof(uint64_t)]) = method::zrange;
   *reinterpret_cast<uint32_t *>(&header_body[0] + sizeof(uint64_t) +
@@ -624,7 +654,7 @@ remote_zrange(conn_pool &pool, std::string_view key, uint32_t min_score,
   *reinterpret_cast<uint32_t *>(body_p) = key.size();
   body_p += sizeof(uint32_t);
   std::copy_n(key.data(), key.size(), body_p);
-  body_p += key.size();
+  body_p += key_size_align;
   *reinterpret_cast<uint32_t *>(body_p) = min_score;
   body_p += sizeof(uint32_t);
   *reinterpret_cast<uint32_t *>(body_p) = max_score;
@@ -641,7 +671,7 @@ remote_zrange(conn_pool &pool, std::string_view key, uint32_t min_score,
     auto value_size = *reinterpret_cast<uint32_t *>(rep_p);
     rep_p += sizeof(uint32_t);
     auto value = std::string_view(rep_p, value_size);
-    rep_p += value_size;
+    rep_p += align_up<sizeof(uint32_t)>(value_size);
     auto score = *reinterpret_cast<uint32_t *>(rep_p);
     rep_p += sizeof(uint32_t);
     sv.emplace_back(value, score);
@@ -651,7 +681,9 @@ remote_zrange(conn_pool &pool, std::string_view key, uint32_t min_score,
 
 task<void> remote_zrmv(conn_pool &pool, std::string_view key,
                        std::string_view value) {
-  auto body_size = key.size() + value.size() + sizeof(uint32_t) * 2;
+  uint32_t key_size_align = align_up<sizeof(uint32_t)>(key.size());
+  uint32_t value_size_align = align_up<sizeof(uint32_t)>(value.size());
+  auto body_size = key_size_align + value_size_align + sizeof(uint32_t) * 2;
   auto header_body = std::vector<char>(kRPCRequestHeaderSize + body_size);
   *reinterpret_cast<method *>(&header_body[sizeof(uint64_t)]) = method::zrmv;
   *reinterpret_cast<uint32_t *>(&header_body[0] + sizeof(uint64_t) +
@@ -660,7 +692,7 @@ task<void> remote_zrmv(conn_pool &pool, std::string_view key,
   *reinterpret_cast<uint32_t *>(body_p) = key.size();
   body_p += sizeof(uint32_t);
   std::copy_n(key.data(), key.size(), body_p);
-  body_p += key.size();
+  body_p += key_size_align;
   *reinterpret_cast<uint32_t *>(body_p) = value.size();
   body_p += sizeof(uint32_t);
   std::copy_n(value.data(), value.size(), body_p);

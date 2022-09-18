@@ -2,7 +2,7 @@
 
 #include <string>
 
-enum method : uint8_t {
+enum method : uint32_t {
   add,
   query,
   list,
