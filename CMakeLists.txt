@@ -88,6 +88,7 @@ target_link_libraries(hcache
     fmt::fmt
     simdjson
     xxhash
+    mimalloc-static
 )
 
 add_executable(pingpong src/pingpong.cc src/threading.cc)
