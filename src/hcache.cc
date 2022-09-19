@@ -45,10 +45,6 @@ template <size_t align> constexpr size_t align_up(const uint64_t size) {
 
 struct send_conn_state {
   std::unique_ptr<uringpp::socket> conn;
-  std::list<output_page> send_buf;
-  std::list<output_page> pending_send_buf;
-  bool sending;
-  bool closed;
 };
 
 task<void> rpc_reply_recv_loop(uringpp::socket &rpc_conn);
@@ -82,11 +78,7 @@ struct conn_pool {
                  sizeof(flags));
     }
     auto state = new send_conn_state{
-        std::make_unique<uringpp::socket>(std::move(rpc_conn)),
-        {},
-        {},
-        false,
-        false};
+        std::make_unique<uringpp::socket>(std::move(rpc_conn))};
 
     rpc_reply_recv_loop(*state->conn).detach();
     co_return state;
@@ -809,10 +801,6 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
     size_t path_len;
     size_t method_len;
     size_t num_headers = 16;
-    bool sending = false;
-    bool closed = false;
-    std::list<output_page> send_buf;
-    std::list<output_page> pending_send_buf;
     phr_header headers[16];
     simdjson::dom::parser parser;
     while (true) {
@@ -1259,16 +1247,18 @@ int main(int argc, char *argv[]) {
   cds::gc::HP hpGC;
   store = std::make_unique<storage>();
   {
-    auto kv_thread = std::jthread([]() {
+    auto kv_thread = std::thread([]() {
       cds::threading::Manager::attachThread();
       store->load_kv();
       cds::threading::Manager::detachThread();
     });
-    auto zset_thread = std::jthread([]() {
+    auto zset_thread = std::thread([]() {
       cds::threading::Manager::attachThread();
       store->load_zset();
       cds::threading::Manager::detachThread();
     });
+    kv_thread.join();
+    zset_thread.join();
   }
   auto flush_thread = std::thread([]() {
     for (;;) {
