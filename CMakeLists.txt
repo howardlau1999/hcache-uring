@@ -8,14 +8,14 @@ ProcessorCount(N)
 
 
 if (CMAKE_CXX_COMPILER_ID MATCHES Clang)
-  set(ROCKSDB_USE_CLANG USE_CLANG=1 CC=clang CXX=clang++ EXTRA_CFLAGS="" EXTRA_CXXFLAGS="-stdlib=libc++")
+  set(ROCKSDB_USE_CLANG USE_CLANG=1 CC=clang CXX=clang++ "EXTRA_CXXFLAGS=-stdlib=libc++ -Wno-unused-but-set-variable")
 endif ()
 ExternalProject_Add(rocksdb_src
     PREFIX ${CMAKE_CURRENT_BINARY_DIR}/rocksdb
     URL ${CMAKE_CURRENT_LIST_DIR}/third_party/rocksdb
     BUILD_IN_SOURCE 1
     CONFIGURE_COMMAND ""
-    BUILD_COMMAND ${ROCKSDB_USE_CLANG} make -j${N} static_lib
+    BUILD_COMMAND ${CMAKE_COMMAND} -E env ${ROCKSDB_USE_CLANG} make -j${N} static_lib
     INSTALL_COMMAND ""
     BUILD_BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/rocksdb/src/rocksdb_src/librocksdb.a"
 )
@@ -43,8 +43,8 @@ if(COMPILER_SUPPORTS_FLTO)
 endif()
 
 if (CMAKE_CXX_COMPILER_ID MATCHES Clang)
-  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS}")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fcoroutines-ts -stdlib=libc++")
+  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wunused-but-set-variable")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fcoroutines-ts -stdlib=libc++ -Wunused-but-set-variable")
 endif ()
 
 find_package(ZLIB)
