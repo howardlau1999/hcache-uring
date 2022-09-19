@@ -895,6 +895,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
         } break;
         case 'd': {
           // del
+          co_await send_all(conn, EMPTY_RESPONSE, sizeof(EMPTY_RESPONSE) - 1);
           std::string_view key(path + 5, path_len - 5);
           auto key_shard = get_shard(key);
           if (key_shard == me) {
@@ -902,10 +903,10 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
           } else {
             co_await remote_del(rpc_clients[key_shard][conn_shard], key);
           }
-          co_await send_all(conn, EMPTY_RESPONSE, sizeof(EMPTY_RESPONSE) - 1);
         } break;
         case 'z': {
           // zrmv
+          co_await send_all(conn, EMPTY_RESPONSE, sizeof(EMPTY_RESPONSE) - 1);
           auto slash_ptr = path + 6;
           auto end_ptr = slash_ptr + path_len - 6;
           while (slash_ptr != end_ptr) {
@@ -922,7 +923,6 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
             co_await remote_zrmv(rpc_clients[key_shard][conn_shard], key,
                                  value);
           }
-          co_await send_all(conn, EMPTY_RESPONSE, sizeof(EMPTY_RESPONSE) - 1);
         } break;
         }
       } break;
@@ -964,6 +964,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
         } break;
         case 'a': {
           // add
+          co_await send_all(conn, EMPTY_RESPONSE, sizeof(EMPTY_RESPONSE) - 1);
           simdjson::padded_string json =
               simdjson::padded_string(body_start, content_length);
           auto doc = parser.parse(json);
@@ -975,10 +976,10 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
           } else {
             co_await remote_add(rpc_clients[key_shard][conn_shard], key, value);
           }
-          co_await send_all(conn, EMPTY_RESPONSE, sizeof(EMPTY_RESPONSE) - 1);
         } break;
         case 'b': {
           // batch
+          co_await send_all(conn, EMPTY_RESPONSE, sizeof(EMPTY_RESPONSE) - 1);
           simdjson::padded_string json =
               simdjson::padded_string(body_start, content_length);
           auto doc = parser.parse(json);
@@ -1005,7 +1006,6 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
           for (auto &&task : tasks) {
             co_await task;
           }
-          co_await send_all(conn, EMPTY_RESPONSE, sizeof(EMPTY_RESPONSE) - 1);
         } break;
         case 'l': {
           // list
@@ -1083,6 +1083,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
           switch (path[2]) {
           case 'a': {
             // zadd
+            co_await send_all(conn, EMPTY_RESPONSE, sizeof(EMPTY_RESPONSE) - 1);
             std::string_view key(&path[6], path_len - 6);
             simdjson::padded_string json =
                 simdjson::padded_string(body_start, content_length);
@@ -1096,7 +1097,6 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
               co_await remote_zadd(rpc_clients[key_shard][conn_shard], key,
                                    value, score);
             }
-            co_await send_all(conn, EMPTY_RESPONSE, sizeof(EMPTY_RESPONSE) - 1);
           } break;
           case 'r': {
             // zrange
