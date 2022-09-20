@@ -1273,7 +1273,7 @@ int main(int argc, char *argv[]) {
       fmt::print("thread {} bind to core {}\n", i, core);
       bind_cpu(core);
       cds::threading::Manager::attachThread();
-      auto loop = loop_with_queue::create(4096, IORING_SETUP_SQPOLL, -1, core);
+      auto loop = loop_with_queue::create(8192);
       loops[i] = loop;
       loop_started.fetch_add(1);
       loop->waker().detach();
@@ -1292,7 +1292,7 @@ int main(int argc, char *argv[]) {
       fmt::print("RPC Thread {} bind to core {}\n", i, core);
       bind_cpu(core);
       cds::threading::Manager::attachThread();
-      auto loop = loop_with_queue::create(4096, IORING_SETUP_SQPOLL, -1, core);
+      auto loop = loop_with_queue::create(8192);
       rpc_loops[i] = loop;
       loop_started.fetch_add(1);
       loop->waker().detach();
