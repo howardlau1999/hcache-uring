@@ -15,6 +15,7 @@
 #include <exception>
 #include <fcntl.h>
 #include <fmt/format.h>
+#include <liburing/io_uring.h>
 #include <linux/time_types.h>
 #include <memory>
 #include <netinet/tcp.h>
@@ -785,7 +786,6 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
   co_await loop->switch_to_io_thread();
   try {
     io_buffer request(65536);
-    int read_idx = 0;
     bool receiving_body = false;
     int n;
     size_t body_received = 0;
@@ -1260,21 +1260,20 @@ int main(int argc, char *argv[]) {
     kv_thread.join();
     zset_thread.join();
   }
+  bind_cpu(cores[0]);
   auto flush_thread = std::thread([]() {
     for (;;) {
       store->flush();
-      std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+      std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
   });
   flush_thread.detach();
-  bind_cpu(cores[0]);
   for (int i = 0; i < cores.size(); ++i) {
     auto thread = std::thread([i, core = cores[i]] {
       fmt::print("thread {} bind to core {}\n", i, core);
       bind_cpu(core);
       cds::threading::Manager::attachThread();
-      auto loop = loop_with_queue::create(32768, IORING_SETUP_ATTACH_WQ,
-                                          main_loop->fd());
+      auto loop = loop_with_queue::create(32768, IORING_SETUP_SQPOLL, -1, core);
       loops[i] = loop;
       loop_started.fetch_add(1);
       loop->waker().detach();
@@ -1293,8 +1292,7 @@ int main(int argc, char *argv[]) {
       fmt::print("RPC Thread {} bind to core {}\n", i, core);
       bind_cpu(core);
       cds::threading::Manager::attachThread();
-      auto loop = loop_with_queue::create(32768, IORING_SETUP_ATTACH_WQ,
-                                          main_loop->fd());
+      auto loop = loop_with_queue::create(32768, IORING_SETUP_SQPOLL, -1, core);
       rpc_loops[i] = loop;
       loop_started.fetch_add(1);
       loop->waker().detach();
