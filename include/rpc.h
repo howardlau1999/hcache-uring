@@ -48,6 +48,8 @@ struct key_value_view {
 struct score_value {
   std::string value;
   uint32_t score;
+  score_value(std::string const &value, uint32_t score)
+      : value(value), score(score) {}
 };
 
 struct score_value_view {
