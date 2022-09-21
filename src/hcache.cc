@@ -307,11 +307,16 @@ uringpp::task<void> xcore_zrmv(std::string_view key, std::string_view value) {
   co_await loops[original_shard_id]->switch_to_io_thread(core);
 }
 
-void xcore_batch_local(std::vector<key_value_view> const &kvs) {
+uringpp::task<void> xcore_batch_local(std::vector<key_value_view> const &kvs) {
   auto write_batch = rocksdb::WriteBatch();
+  auto start = now();
   for (auto const kv : kvs) {
     kvs_->insert({std::string(kv.key), std::string(kv.value)});
     write_batch.Put(kv.key, kv.value);
+    if (exceed_quota(start)) {
+      co_await loops[shard_id]->switch_to_io_thread(shard_id);
+      start = now();
+    }
   }
   kv_db_->Write(write_options, &write_batch);
 }
@@ -320,7 +325,7 @@ uringpp::task<void> xcore_batch_remote(std::vector<key_value_view> const &kvs,
                                        size_t from_shard_id,
                                        size_t target_shard_id) {
   co_await loops[target_shard_id]->switch_to_io_thread(from_shard_id);
-  xcore_batch_local(kvs);
+  co_await xcore_batch_local(kvs);
   co_await loops[from_shard_id]->switch_to_io_thread(target_shard_id);
 }
 
@@ -340,23 +345,34 @@ uringpp::task<void> xcore_batch(std::vector<key_value_view> const &kvs) {
           xcore_batch_remote(kvs_per_core[i], original_shard_id, i));
     }
   }
-  xcore_batch_local(kvs_per_core[shard_id]);
+  co_await xcore_batch_local(kvs_per_core[shard_id]);
   for (auto &task : tasks) {
     co_await task;
   }
 }
 
 uringpp::task<std::vector<key_view_value>>
-xcore_list_remote(std::vector<std::string_view> const &keys,
-                  size_t from_shard_id, size_t target_shard_id) {
-  co_await loops[target_shard_id]->switch_to_io_thread(from_shard_id);
+xcore_list_local(std::vector<std::string_view> const &keys) {
+  auto start = now();
   std::vector<key_view_value> result;
   for (auto const key : keys) {
     auto it = kvs_->find(key);
     if (it != kvs_->end()) {
       result.push_back({key, it->second});
     }
+    if (exceed_quota(start)) {
+      co_await loops[shard_id]->switch_to_io_thread(shard_id);
+      start = now();
+    }
   }
+  co_return result;
+}
+
+uringpp::task<std::vector<key_view_value>>
+xcore_list_remote(std::vector<std::string_view> const &keys,
+                  size_t from_shard_id, size_t target_shard_id) {
+  co_await loops[target_shard_id]->switch_to_io_thread(from_shard_id);
+  auto result = co_await xcore_list_local(keys);
   co_await loops[from_shard_id]->switch_to_io_thread(target_shard_id);
   co_return result;
 }
@@ -380,16 +396,49 @@ uringpp::task<std::vector<std::vector<key_view_value>>> xcore_list(It begin,
     }
   }
   std::vector<std::vector<key_view_value>> result;
-  result.push_back({});
-  for (auto const key : keys_per_core[shard_id]) {
-    auto it = kvs_->find(key);
-    if (it != kvs_->end()) {
-      result.back().emplace_back(key, it->second);
-    }
-  }
+  result.emplace_back(co_await xcore_list_local(keys_per_core[shard_id]));
   for (auto &task : tasks) {
     auto res = co_await task;
     result.emplace_back(std::move(res));
+  }
+  co_return result;
+}
+
+uringpp::task<void> maybe_yield(std::chrono::steady_clock::time_point &start) {
+  if (exceed_quota(start)) {
+    co_await loops[shard_id]->switch_to_io_thread(shard_id);
+    start = now();
+  }
+}
+
+uringpp::task<std::optional<std::vector<score_value>>>
+xcore_zrange_local(std::string_view key, uint32_t min_score,
+                   uint32_t max_score) {
+  auto it = zsets_->find(key);
+  if (it == zsets_->end()) {
+    co_return std::nullopt;
+  }
+  auto &score_values = it->second->score_values;
+  auto start = now();
+  std::vector<score_value> result;
+  for (auto score = min_score; score <= max_score;) {
+    auto score_value_it = score_values.lower_bound(score);
+    if (score_value_it == score_values.end()) {
+      break;
+    }
+    while (score_value_it != score_values.end() &&
+           score_value_it->first == score) {
+      for (auto const &value : score_value_it->second) {
+        result.emplace_back(value.key, score);
+      }
+      ++score_value_it;
+      co_await maybe_yield(start);
+    }
+    if (score_value_it == score_values.end()) {
+      break;
+    }
+    score = score_value_it->first;
+    co_await maybe_yield(start);
   }
   co_return result;
 }
@@ -398,35 +447,11 @@ uringpp::task<std::optional<std::vector<score_value>>>
 xcore_zrange(std::string_view key, uint32_t min_score, uint32_t max_score) {
   auto core = get_core(key);
   if (core == shard_id) {
-    auto it = zsets_->find(key);
-    if (it == zsets_->end()) {
-      co_return std::nullopt;
-    }
-    auto const &score_values = it->second->score_values;
-    std::vector<score_value> result;
-    for (auto it = score_values.lower_bound(min_score);
-         it != score_values.end() && it->first <= max_score; ++it) {
-      for (auto const &value : it->second) {
-        result.emplace_back(value.key, it->first);
-      }
-    }
-    co_return result;
+    co_return co_await xcore_zrange_local(key, min_score, max_score);
   }
   auto original_shard_id = shard_id;
   co_await loops[core]->switch_to_io_thread(original_shard_id);
-  auto it = zsets_->find(key);
-  if (it == zsets_->end()) {
-    co_await loops[original_shard_id]->switch_to_io_thread(core);
-    co_return std::nullopt;
-  }
-  auto &score_values = it->second->score_values;
-  std::vector<score_value> result;
-  for (auto it = score_values.lower_bound(min_score);
-       it != score_values.end() && it->first <= max_score; ++it) {
-    for (auto const &value : it->second) {
-      result.emplace_back(value.key, it->first);
-    }
-  }
+  auto result = co_await xcore_zrange_local(key, min_score, max_score);
   co_await loops[original_shard_id]->switch_to_io_thread(core);
   co_return result;
 }
@@ -435,12 +460,35 @@ const char HTTP_404[] = "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n";
 const char HTTP_400[] = "HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\n\r\n";
 const char OK_RESPONSE[] = "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok";
 const char EMPTY_RESPONSE[] = "HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n";
+const char EMPTY_ARRAY[] = "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n[]";
+const char CHUNK_RESPONSE[] =
+    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+const char CHUNK_END[] = "1\r\n]\r\n0\r\n\r\n";
 const char LOADING_RESPONSE[] =
     "HTTP/1.1 200 OK\r\ncontent-length: 7\r\n\r\nloading";
 const char HTTP_200_HEADER[] = "HTTP/1.1 200 OK\r\ncontent-length: ";
 const char HEADER_END[] = "\r\n\r\n";
 
 constexpr size_t kMaxWriteSize = 1024 * 1024 * 1024;
+
+size_t itohex(char *buf, size_t n) {
+  size_t i = 0;
+  if (n == 0) {
+    buf[i++] = '0';
+    return i;
+  }
+  while (n) {
+    auto c = n % 16;
+    if (c < 10) {
+      buf[i++] = '0' + c;
+    } else {
+      buf[i++] = 'a' + c - 10;
+    }
+    n /= 16;
+  }
+  std::reverse(buf, buf + i);
+  return i;
+}
 
 size_t itoa(char *buf, size_t n) {
   size_t i = 0;
@@ -525,6 +573,23 @@ uringpp::task<void> writev_all(uringpp::socket &conn, struct iovec *iov,
 }
 
 constexpr size_t kRPCReplyHeaderSize = sizeof(uint64_t) + sizeof(uint32_t);
+
+uringpp::task<void> rpc_reply_header(uringpp::socket &conn, uint64_t req_id,
+                                     uint32_t len, uint32_t count) {
+  char header[kRPCReplyHeaderSize];
+  auto p = header;
+  *(uint64_t *)p = req_id;
+  p += sizeof(uint64_t);
+  *(uint32_t *)p = len;
+  p += sizeof(uint32_t);
+  struct iovec iov[2];
+  iov[0].iov_base = header;
+  iov[0].iov_len = kRPCReplyHeaderSize;
+  iov[1].iov_base = (void *)(&count);
+  iov[1].iov_len = sizeof(uint32_t);
+  co_await writev_all(conn, iov, 2);
+}
+
 uringpp::task<void> rpc_reply(uringpp::socket &conn, uint64_t req_id,
                               std::vector<char> data) {
   char header[kRPCReplyHeaderSize];
@@ -638,10 +703,9 @@ task<void> handle_rpc(uringpp::socket conn, size_t conn_id) {
       std::vector<std::string_view> keys;
       for (uint32_t i = 0; i < key_count; i++) {
         uint32_t key_size = *reinterpret_cast<uint32_t *>(req_p);
-        uint32_t key_size_align = align_up<sizeof(uint32_t)>(key_size);
         req_p += sizeof(key_size);
         std::string_view key(req_p, key_size);
-        req_p += key_size_align;
+        req_p += key_size;
         keys.push_back(key);
       }
       auto values = co_await xcore_list(keys.begin(), keys.end());
@@ -650,32 +714,38 @@ task<void> handle_rpc(uringpp::socket conn, size_t conn_id) {
       for (auto &v : values) {
         total_count += v.size();
         for (auto const kv : v) {
-          rep_body_size += sizeof(uint32_t) * 2 +
-                           align_up<sizeof(uint32_t)>(kv.key.size()) +
-                           align_up<sizeof(uint32_t)>(kv.value.size());
+          rep_body_size +=
+              sizeof(uint32_t) * 2 + kv.key.size() + kv.value.size();
         }
       }
       assert(rep_body_size % sizeof(uint32_t) == 0);
       auto rep_body = std::vector<char>(rep_body_size);
-      auto p = &rep_body[0];
-      *reinterpret_cast<uint32_t *>(p) = total_count;
-      p += sizeof(uint32_t);
-      for (auto &vv : values) {
-        for (auto const v : vv) {
-          *reinterpret_cast<uint32_t *>(p) = v.key.size();
-          uint32_t key_size_align = align_up<sizeof(uint32_t)>(v.key.size());
-          p += sizeof(uint32_t);
-          std::copy_n(v.key.data(), v.key.size(), p);
-          p += key_size_align;
-          *reinterpret_cast<uint32_t *>(p) = v.value.size();
-          uint32_t value_size_align =
-              align_up<sizeof(uint32_t)>(v.value.size());
-          p += sizeof(uint32_t);
-          std::copy_n(v.value.data(), v.value.size(), p);
-          p += value_size_align;
+      co_await rpc_reply_header(conn, req_id, rep_body.size(), total_count);
+      constexpr size_t batch_size = 32;
+      uint32_t sizes[batch_size * 2];
+      struct iovec iov[batch_size * 4];
+      size_t batch_idx = 0;
+      for (auto const &vkv : values) {
+        for (auto const &kv : vkv) {
+          sizes[batch_idx * 2] = kv.key.size();
+          sizes[batch_idx * 2 + 1] = kv.value.size();
+          iov[batch_idx * 4].iov_base = &sizes[batch_idx * 2];
+          iov[batch_idx * 4].iov_len = sizeof(uint32_t);
+          iov[batch_idx * 4 + 1].iov_base = const_cast<char *>(kv.key.data());
+          iov[batch_idx * 4 + 1].iov_len = kv.key.size();
+          iov[batch_idx * 4 + 2].iov_base = &sizes[batch_idx * 2 + 1];
+          iov[batch_idx * 4 + 2].iov_len = sizeof(uint32_t);
+          iov[batch_idx * 4 + 3].iov_base = const_cast<char *>(kv.value.data());
+          iov[batch_idx * 4 + 3].iov_len = kv.value.size();
+          if (++batch_idx == batch_size) {
+            co_await writev_all(conn, iov, batch_idx * 4);
+            batch_idx = 0;
+          }
         }
       }
-      co_await rpc_reply(conn, req_id, std::move(rep_body));
+      if (batch_idx > 0) {
+        co_await writev_all(conn, iov, batch_idx * 4);
+      }
     } break;
     case method::batch: {
       uint32_t count = *reinterpret_cast<uint32_t *>(req_p);
@@ -683,19 +753,17 @@ task<void> handle_rpc(uringpp::socket conn, size_t conn_id) {
       std::vector<key_value_view> kvs(count);
       for (uint32_t i = 0; i < count; i++) {
         uint32_t key_size = *reinterpret_cast<uint32_t *>(req_p);
-        uint32_t key_size_align = align_up<sizeof(uint32_t)>(key_size);
         req_p += sizeof(key_size);
         std::string_view key(req_p, key_size);
-        req_p += key_size_align;
+        req_p += key_size;
         uint32_t value_size = *reinterpret_cast<uint32_t *>(req_p);
-        uint32_t value_size_align = align_up<sizeof(uint32_t)>(value_size);
         req_p += sizeof(value_size);
         std::string_view value(req_p, value_size);
-        req_p += value_size_align;
+        req_p += value_size;
         kvs[i] = {key, value};
       }
-      co_await xcore_batch(kvs);
       co_await rpc_reply(conn, req_id, {});
+      co_await xcore_batch(kvs);
     } break;
     case method::zadd: {
       uint32_t key_size = *reinterpret_cast<uint32_t *>(req_p);
@@ -710,8 +778,8 @@ task<void> handle_rpc(uringpp::socket conn, size_t conn_id) {
       req_p += value_size_align;
       uint32_t score = *reinterpret_cast<uint32_t *>(req_p);
       req_p += sizeof(score);
-      co_await xcore_zadd(key, value, score);
       co_await rpc_reply(conn, req_id, {});
+      co_await xcore_zadd(key, value, score);
     } break;
     case method::zrmv: {
       uint32_t key_size = *reinterpret_cast<uint32_t *>(req_p);
@@ -724,8 +792,8 @@ task<void> handle_rpc(uringpp::socket conn, size_t conn_id) {
       req_p += sizeof(value_size);
       std::string_view value(req_p, value_size);
       req_p += value_size_align;
-      co_await xcore_zrmv(key, value);
       co_await rpc_reply(conn, req_id, {});
+      co_await xcore_zrmv(key, value);
     } break;
     case method::zrange: {
       uint32_t key_size = *reinterpret_cast<uint32_t *>(req_p);
@@ -744,22 +812,29 @@ task<void> handle_rpc(uringpp::socket conn, size_t conn_id) {
         auto const &score_values = values.value();
         size_t rep_body_size = sizeof(uint32_t);
         for (auto &v : score_values) {
-          rep_body_size +=
-              sizeof(uint32_t) * 2 + align_up<sizeof(uint32_t)>(v.value.size());
+          rep_body_size += sizeof(uint32_t) * 2 + v.value.size();
         }
-        auto rep_body = std::vector<char>(rep_body_size);
-        auto p = &rep_body[0];
-        *reinterpret_cast<uint32_t *>(p) = score_values.size();
-        p += sizeof(uint32_t);
-        for (auto &sv : score_values) {
-          *reinterpret_cast<uint32_t *>(p) = sv.value.size();
-          p += sizeof(uint32_t);
-          std::copy_n(sv.value.data(), sv.value.size(), p);
-          p += align_up<sizeof(uint32_t)>(sv.value.size());
-          *reinterpret_cast<uint32_t *>(p) = sv.score;
-          p += sizeof(uint32_t);
+        co_await rpc_reply_header(conn, req_id, rep_body_size, values->size());
+        constexpr size_t batch_size = 32;
+        struct iovec iov[batch_size * 3];
+        size_t batch_idx = 0;
+        uint32_t sizes[batch_size];
+        for (auto const &sv : score_values) {
+          sizes[batch_idx] = sv.value.size();
+          iov[batch_idx * 3].iov_base = &sizes[batch_idx];
+          iov[batch_idx * 3].iov_len = sizeof(uint32_t);
+          iov[batch_idx * 3 + 1].iov_base = (void *)sv.value.data();
+          iov[batch_idx * 3 + 1].iov_len = sv.value.size();
+          iov[batch_idx * 3 + 2].iov_base = (void *)&sv.score;
+          iov[batch_idx * 3 + 2].iov_len = sizeof(uint32_t);
+          if (++batch_idx == batch_size) {
+            co_await writev_all(conn, iov, batch_idx * 3);
+            batch_idx = 0;
+          }
         }
-        co_await rpc_reply(conn, req_id, std::move(rep_body));
+        if (batch_idx > 0) {
+          co_await writev_all(conn, iov, batch_idx * 3);
+        }
       }
     } break;
     }
@@ -855,56 +930,110 @@ task<void> remote_del(conn_pool &pool, std::string_view key) {
                     kRPCRequestHeaderSize + body_size);
 }
 
+task<void> send_batch_kv(send_conn_state *state, conn_pool &pool,
+                         std::vector<key_value_view> const &kvs) {
+  constexpr size_t batch_size = 32;
+  uint32_t sizes[batch_size * 2];
+  struct iovec iov[batch_size * 4];
+  size_t batch_idx = 0;
+  for (auto const kv : kvs) {
+    sizes[batch_idx * 2] = kv.key.size();
+    sizes[batch_idx * 2 + 1] = kv.value.size();
+    iov[batch_idx * 4].iov_base = (void *)&sizes[batch_idx * 2];
+    iov[batch_idx * 4].iov_len = sizeof(uint32_t);
+    iov[batch_idx * 4 + 1].iov_base = (void *)kv.key.data();
+    iov[batch_idx * 4 + 1].iov_len = kv.key.size();
+    iov[batch_idx * 4 + 2].iov_base = (void *)&sizes[batch_idx * 2 + 1];
+    iov[batch_idx * 4 + 2].iov_len = sizeof(uint32_t);
+    iov[batch_idx * 4 + 3].iov_base = (void *)kv.value.data();
+    iov[batch_idx * 4 + 3].iov_len = kv.value.size();
+    if (++batch_idx == batch_size) {
+      co_await writev_all(*state->conn, iov, batch_idx * 4);
+      batch_idx = 0;
+    }
+  }
+  if (batch_idx > 0) {
+    co_await writev_all(*state->conn, iov, batch_idx * 4);
+  }
+  pool.put_conn(state);
+  co_await std::suspend_always{};
+}
+
 task<void> remote_batch(conn_pool &pool,
                         std::vector<key_value_view> const &kvs) {
   auto body_size = sizeof(uint32_t);
   for (auto const kv : kvs) {
-    body_size += sizeof(uint32_t) * 2 +
-                 align_up<sizeof(uint32_t)>(kv.key.size()) +
-                 align_up<sizeof(uint32_t)>(kv.value.size());
+    body_size += sizeof(uint32_t) * 2 + kv.key.size() + kv.value.size();
   }
-  auto header_body = std::vector<char>(kRPCRequestHeaderSize + body_size);
+  auto pending = new pending_call;
+  auto header_body = std::vector<char>(kRPCRequestHeaderSize);
+  *reinterpret_cast<uint64_t *>(&header_body[0]) =
+      reinterpret_cast<uint64_t>(pending);
   *reinterpret_cast<method *>(&header_body[sizeof(uint64_t)]) = method::batch;
   *reinterpret_cast<uint32_t *>(&header_body[0] + sizeof(uint64_t) +
                                 sizeof(method)) = body_size;
-  auto body_p = &header_body[0] + kRPCRequestHeaderSize;
-  *reinterpret_cast<uint32_t *>(body_p) = kvs.size();
-  body_p += sizeof(uint32_t);
-  for (auto const kv : kvs) {
-    *reinterpret_cast<uint32_t *>(body_p) = kv.key.size();
-    body_p += sizeof(uint32_t);
-    std::copy_n(kv.key.data(), kv.key.size(), body_p);
-    body_p += align_up<sizeof(uint32_t)>(kv.key.size());
-    *reinterpret_cast<uint32_t *>(body_p) = kv.value.size();
-    body_p += sizeof(uint32_t);
-    std::copy_n(kv.value.data(), kv.value.size(), body_p);
-    body_p += align_up<sizeof(uint32_t)>(kv.value.size());
+  struct iovec iov[2];
+  uint32_t count = kvs.size();
+  iov[0].iov_base = (void *)&header_body[0];
+  iov[0].iov_len = kRPCRequestHeaderSize;
+  iov[1].iov_base = (void *)&count;
+  iov[1].iov_len = sizeof(count);
+  auto conn = co_await pool.get_conn();
+  co_await writev_all(*conn->conn, iov, 2);
+  auto t = send_batch_kv(conn, pool, kvs);
+  pending->h = t.h_;
+  co_await t;
+}
+
+task<void> send_list_keys(send_conn_state *state, conn_pool &pool,
+                          std::unordered_set<std::string_view> const &keys) {
+  constexpr size_t batch_size = 512;
+  struct iovec iov[batch_size * 2];
+  uint32_t sizes[batch_size];
+  size_t batch_idx = 0;
+  for (auto const k : keys) {
+    sizes[batch_idx] = k.size();
+    iov[batch_idx * 2].iov_base = &sizes[batch_idx];
+    iov[batch_idx * 2].iov_len = sizeof(sizes[batch_idx]);
+    iov[batch_idx * 2 + 1].iov_base = const_cast<char *>(k.data());
+    iov[batch_idx * 2 + 1].iov_len = k.size();
+    if (++batch_idx == batch_size) {
+      co_await writev_all(*state->conn, iov, batch_idx * 2);
+      batch_idx = 0;
+    }
   }
-  co_await rpc_call(pool, std::move(header_body),
-                    kRPCRequestHeaderSize + body_size);
+  if (batch_idx > 0) {
+    co_await writev_all(*state->conn, iov, batch_idx * 2);
+  }
+  pool.put_conn(state);
+  co_await std::suspend_always{};
 }
 
 task<std::pair<std::vector<char>, std::vector<key_value_view>>>
 remote_list(conn_pool &pool, std::unordered_set<std::string_view> const &keys) {
   auto body_size = sizeof(uint32_t);
   for (auto const &key : keys) {
-    body_size += sizeof(uint32_t) + align_up<sizeof(uint32_t)>(key.size());
+    body_size += sizeof(uint32_t) + key.size();
   }
-  auto header_body = std::vector<char>(kRPCRequestHeaderSize + body_size);
+  auto header_body = std::vector<char>(kRPCRequestHeaderSize);
+  auto pending = new pending_call;
+  *reinterpret_cast<uint64_t *>(&header_body[0]) =
+      reinterpret_cast<uint64_t>(pending);
   *reinterpret_cast<method *>(&header_body[sizeof(uint64_t)]) = method::list;
   *reinterpret_cast<uint32_t *>(&header_body[0] + sizeof(uint64_t) +
                                 sizeof(method)) = body_size;
-  auto body_p = &header_body[0] + kRPCRequestHeaderSize;
-  *reinterpret_cast<uint32_t *>(body_p) = keys.size();
-  body_p += sizeof(uint32_t);
-  for (auto const &key : keys) {
-    *reinterpret_cast<uint32_t *>(body_p) = key.size();
-    body_p += sizeof(uint32_t);
-    std::copy_n(key.data(), key.size(), body_p);
-    body_p += align_up<sizeof(uint32_t)>(key.size());
-  }
-  auto response = co_await rpc_call(pool, std::move(header_body),
-                                    kRPCRequestHeaderSize + body_size);
+  auto conn = co_await pool.get_conn();
+  struct iovec header_iov[2];
+  uint32_t count = keys.size();
+  header_iov[0].iov_base = &header_body[0];
+  header_iov[0].iov_len = kRPCRequestHeaderSize;
+  header_iov[1].iov_base = &count;
+  header_iov[1].iov_len = sizeof(count);
+  co_await writev_all(*conn->conn, header_iov, 2);
+  auto t = send_list_keys(conn, pool, keys);
+  pending->h = t.h_;
+  co_await t;
+  std::vector<char> response = std::move(pending->response);
   auto rep_p = response.data();
   auto rep_count = *reinterpret_cast<uint32_t *>(rep_p);
   rep_p += sizeof(uint32_t);
@@ -913,11 +1042,11 @@ remote_list(conn_pool &pool, std::unordered_set<std::string_view> const &keys) {
     auto key_size = *reinterpret_cast<uint32_t *>(rep_p);
     rep_p += sizeof(uint32_t);
     auto key = std::string_view(rep_p, key_size);
-    rep_p += align_up<sizeof(uint32_t)>(key_size);
+    rep_p += key_size;
     auto value_size = *reinterpret_cast<uint32_t *>(rep_p);
     rep_p += sizeof(uint32_t);
     auto value = std::string_view(rep_p, value_size);
-    rep_p += align_up<sizeof(uint32_t)>(value_size);
+    rep_p += value_size;
     kvs.emplace_back(key, value);
   }
   co_return {std::move(response), std::move(kvs)};
@@ -976,7 +1105,7 @@ remote_zrange(conn_pool &pool, std::string_view key, uint32_t min_score,
     auto value_size = *reinterpret_cast<uint32_t *>(rep_p);
     rep_p += sizeof(uint32_t);
     auto value = std::string_view(rep_p, value_size);
-    rep_p += align_up<sizeof(uint32_t)>(value_size);
+    rep_p += value_size;
     auto score = *reinterpret_cast<uint32_t *>(rep_p);
     rep_p += sizeof(uint32_t);
     sv.emplace_back(value, score);
@@ -1353,37 +1482,76 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
           if (local_kv_count == 0 && remote_kv_count == 0) {
             co_await send_all(conn, HTTP_404, sizeof(HTTP_404) - 1);
           } else {
-            rapidjson::StringBuffer buffer;
-            {
+            co_await send_all(conn, CHUNK_RESPONSE, sizeof(CHUNK_RESPONSE) - 1);
+            auto write_kv = [](rapidjson::StringBuffer &buffer,
+                               std::string_view key, std::string_view value) {
               auto d = rapidjson::Document();
-              auto &kv_list = d.SetArray();
-              auto &allocator = d.GetAllocator();
-              kv_list.Reserve(remote_kv_count + local_key_values.size(),
-                              allocator);
-              auto write_kv = [&](std::string_view key,
-                                  std::string_view value) {
-                auto kv_object = rapidjson::Value(rapidjson::kObjectType);
-                auto k_string = rapidjson::StringRef(key.data(), key.size());
-                auto v_string =
-                    rapidjson::StringRef(value.data(), value.size());
-                kv_object.AddMember("key", k_string, allocator);
-                kv_object.AddMember("value", v_string, allocator);
-                kv_list.PushBack(kv_object, allocator);
-              };
-              for (auto &core_kv : local_key_values) {
-                for (auto &kv : core_kv) {
-                  write_kv(kv.key, kv.value);
-                }
-              }
-              for (auto const &remote_kvs : remote_key_values) {
-                for (auto const kv : remote_kvs) {
-                  write_kv(kv.key, kv.value);
-                }
-              }
-              rapidjson::Writer writer(buffer);
+              d.SetObject();
+              auto &a = d.GetAllocator();
+              d.AddMember("key", rapidjson::StringRef(key.data(), key.size()),
+                          a);
+              d.AddMember("value",
+                          rapidjson::StringRef(value.data(), value.size()), a);
+              rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
               d.Accept(writer);
+            };
+            constexpr size_t batch_size = 16;
+            bool first = true;
+            char left_bracket = '[';
+            char comma = ',';
+            size_t batch_idx = 0;
+            size_t chunk_size = 0;
+            rapidjson::StringBuffer buffer[batch_size];
+            char chunk_length[32];
+            const char chunk_end[] = "\r\n";
+            struct iovec iov[batch_size * 2 + 2];
+            iov[0].iov_base = chunk_length;
+            auto send_batch_chunk = [&]() -> task<void> {
+              for (size_t i = 0; i < batch_idx; ++i) {
+                if (first) {
+                  first = false;
+                  iov[i * 2 + 1].iov_base = &left_bracket;
+                } else {
+                  iov[i * 2 + 1].iov_base = &comma;
+                }
+                iov[i * 2 + 1].iov_len = 1;
+                iov[i * 2 + 2].iov_base = (void *)buffer[i].GetString();
+                iov[i * 2 + 2].iov_len = buffer[i].GetSize();
+                chunk_size += 1 + buffer[i].GetSize();
+              }
+              iov[batch_idx * 2 + 1].iov_base = (void *)chunk_end;
+              iov[batch_idx * 2 + 1].iov_len = 2;
+              auto chunk_size_len = itohex(chunk_length, chunk_size);
+              chunk_length[chunk_size_len++] = '\r';
+              chunk_length[chunk_size_len++] = '\n';
+              iov[0].iov_len = chunk_size_len;
+              co_await writev_all(conn, iov, batch_idx * 2 + 2);
+              for (size_t i = 0; i < batch_idx; ++i) {
+                buffer[i].Clear();
+              }
+              batch_idx = 0;
+              chunk_size = 0;
+            };
+            for (auto &core_kv : local_key_values) {
+              for (auto &kv : core_kv) {
+                write_kv(buffer[batch_idx], kv.key, kv.value);
+                if (++batch_idx == batch_size) {
+                  co_await send_batch_chunk();
+                }
+              }
             }
-            co_await send_json(conn, std::move(buffer));
+            for (auto &remote_kv : remote_key_values) {
+              for (auto &kv : remote_kv) {
+                write_kv(buffer[batch_idx], kv.key, kv.value);
+                if (++batch_idx == batch_size) {
+                  co_await send_batch_chunk();
+                }
+              }
+            }
+            if (batch_idx > 0) {
+              co_await send_batch_chunk();
+            }
+            co_await send_all(conn, CHUNK_END, sizeof(CHUNK_END) - 1);
           }
         } break;
         case 'z': {
@@ -1414,29 +1582,74 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
             auto min_score = score_range["min_score"].get_uint64().take_value();
             auto max_score = score_range["max_score"].get_uint64().take_value();
             auto key_shard = get_shard(key);
-            rapidjson::StringBuffer buffer;
-            auto d = rapidjson::Document();
-            auto &sv_list = d.SetArray();
-            auto &allocator = d.GetAllocator();
-            auto write_sv = [&](std::string_view value, uint32_t score) {
-              auto sv_object = rapidjson::Value(rapidjson::kObjectType);
+            auto write_sv = [&](rapidjson::StringBuffer &buffer,
+                                std::string_view value, uint32_t score) {
+              auto d = rapidjson::Document();
+              auto &sv_object = d.SetObject();
+              auto &allocator = d.GetAllocator();
               auto v_string = rapidjson::StringRef(value.data(), value.size());
               sv_object.AddMember("value", v_string, allocator);
               sv_object.AddMember("score", score, allocator);
-              sv_list.PushBack(sv_object, allocator);
+              rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
+              d.Accept(writer);
+            };
+            constexpr size_t batch_size = 16;
+            bool first = true;
+            char left_bracket = '[';
+            char comma = ',';
+            size_t batch_idx = 0;
+            size_t chunk_size = 0;
+            rapidjson::StringBuffer buffer[batch_size];
+            char chunk_length[32];
+            const char chunk_end[] = "\r\n";
+            struct iovec iov[batch_size * 2 + 2];
+            iov[0].iov_base = chunk_length;
+            auto send_batch_chunk = [&]() -> task<void> {
+              for (size_t i = 0; i < batch_idx; ++i) {
+                if (first) {
+                  first = false;
+                  iov[i * 2 + 1].iov_base = &left_bracket;
+                } else {
+                  iov[i * 2 + 1].iov_base = &comma;
+                }
+                iov[i * 2 + 1].iov_len = 1;
+                iov[i * 2 + 2].iov_base = (void *)buffer[i].GetString();
+                iov[i * 2 + 2].iov_len = buffer[i].GetSize();
+                chunk_size += 1 + buffer[i].GetSize();
+              }
+              iov[batch_idx * 2 + 1].iov_base = (void *)chunk_end;
+              iov[batch_idx * 2 + 1].iov_len = 2;
+              auto chunk_size_len = itohex(chunk_length, chunk_size);
+              chunk_length[chunk_size_len++] = '\r';
+              chunk_length[chunk_size_len++] = '\n';
+              iov[0].iov_len = chunk_size_len;
+              co_await writev_all(conn, iov, batch_idx * 2 + 2);
+              for (size_t i = 0; i < batch_idx; ++i) {
+                buffer[i].Clear();
+              }
+              batch_idx = 0;
+              chunk_size = 0;
             };
             if (key_shard == me) {
               auto score_values =
                   co_await xcore_zrange(key, min_score, max_score);
               if (!score_values.has_value()) {
                 co_await send_all(conn, HTTP_404, sizeof(HTTP_404) - 1);
+              } else if (score_values->empty()) {
+                co_await send_all(conn, EMPTY_ARRAY, sizeof(EMPTY_ARRAY) - 1);
               } else {
+                co_await send_all(conn, CHUNK_RESPONSE,
+                                  sizeof(CHUNK_RESPONSE) - 1);
                 for (auto &sv : score_values.value()) {
-                  write_sv(sv.value, sv.score);
+                  write_sv(buffer[batch_idx], sv.value, sv.score);
+                  if (++batch_idx == batch_size) {
+                    co_await send_batch_chunk();
+                  }
                 }
-                rapidjson::Writer writer(buffer);
-                d.Accept(writer);
-                co_await send_json(conn, std::move(buffer));
+                if (batch_idx > 0) {
+                  co_await send_batch_chunk();
+                }
+                co_await send_all(conn, CHUNK_END, sizeof(CHUNK_END) - 1);
               }
             } else {
               auto score_values =
@@ -1444,13 +1657,21 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
                                          key, min_score, max_score);
               if (!score_values.has_value()) {
                 co_await send_all(conn, HTTP_404, sizeof(HTTP_404) - 1);
+              } else if (score_values->second.empty()) {
+                co_await send_all(conn, EMPTY_ARRAY, sizeof(EMPTY_ARRAY) - 1);
               } else {
+                co_await send_all(conn, CHUNK_RESPONSE,
+                                  sizeof(CHUNK_RESPONSE) - 1);
                 for (auto &sv : score_values.value().second) {
-                  write_sv(sv.value, sv.score);
+                  write_sv(buffer[batch_idx], sv.value, sv.score);
+                  if (++batch_idx == batch_size) {
+                    co_await send_batch_chunk();
+                  }
                 }
-                rapidjson::Writer writer(buffer);
-                d.Accept(writer);
-                co_await send_json(conn, std::move(buffer));
+                if (batch_idx > 0) {
+                  co_await send_batch_chunk();
+                }
+                co_await send_all(conn, CHUNK_END, sizeof(CHUNK_END) - 1);
               }
             }
           } break;
