@@ -2,12 +2,16 @@
 #include "fmt/core.h"
 #include "io_buffer.h"
 #include "rapidjson/stringbuffer.h"
+#include "rocksdb/options.h"
+#include "rocksdb/sst_file_writer.h"
 #include "rpc.h"
 #include "storage.h"
 #include "threading.h"
 #include <algorithm>
 #include <array>
 #include <bits/types/struct_iovec.h>
+#include <boost/algorithm/string/classification.hpp>
+#include <boost/algorithm/string/split.hpp>
 #include <cassert>
 #include <chrono>
 #include <coroutine>
@@ -15,10 +19,12 @@
 #include <cstdint>
 #include <exception>
 #include <fcntl.h>
+#include <filesystem>
 #include <fmt/format.h>
 #include <liburing/io_uring.h>
 #include <linux/time_types.h>
 #include <memory>
+#include <mutex>
 #include <netinet/tcp.h>
 #include <picohttpparser/picohttpparser.h>
 #include <queue>
@@ -41,6 +47,33 @@
 
 using uringpp::task;
 using namespace std::chrono_literals;
+
+rocksdb::WriteOptions write_options;
+
+void init_load();
+
+std::vector<char> encode_zset_key(std::string_view key,
+                                  std::string_view value) {
+  std::vector<char> full_key(key.size() + value.size() + 1);
+  std::copy(key.begin(), key.end(), full_key.begin());
+  full_key[key.size()] = '\0';
+  std::copy(value.begin(), value.end(), full_key.begin() + key.size() + 1);
+  return full_key;
+}
+
+std::pair<std::string_view, std::string_view>
+decode_zset_key(rocksdb::Slice const &full_key) {
+  size_t zero_pos = 0;
+  for (size_t i = 0; i < full_key.size(); ++i) {
+    if (full_key[i] == '\0') {
+      zero_pos = i;
+      break;
+    }
+  }
+  return {std::string_view(full_key.data(), zero_pos),
+          std::string_view(full_key.data() + zero_pos + 1,
+                           full_key.size() - zero_pos - 1)};
+}
 
 const std::chrono::milliseconds task_quota = 10ms;
 
@@ -132,11 +165,17 @@ size_t nr_peers = 1;
 size_t me = 0;
 
 thread_local size_t shard_id;
-thread_local unordered_string_map<std::string> kvs_;
-thread_local unordered_string_map<std::unique_ptr<zset_stl>> zsets_;
+thread_local unordered_string_map<std::string> *kvs_;
+thread_local unordered_string_map<std::unique_ptr<zset_stl>> *zsets_;
 thread_local rocksdb::DB *kv_db_;
 thread_local rocksdb::DB *zset_db_;
-std::vector<bool> init_ok;
+std::vector<unordered_string_map<std::string> *> kv_shards_;
+std::vector<unordered_string_map<std::unique_ptr<zset_stl>> *> zset_shards_;
+std::vector<std::mutex *> init_locks_;
+std::vector<rocksdb::DB *> kv_db_shards_;
+std::vector<rocksdb::DB *> zset_db_shards_;
+std::atomic<bool> kv_initializing_;
+std::atomic<bool> kv_initialized_;
 
 size_t get_shard(std::string_view key) {
   auto hash = XXH64(key.data(), key.size(), 19260817);
@@ -144,15 +183,15 @@ size_t get_shard(std::string_view key) {
 }
 
 size_t get_core(std::string_view key) {
-  auto hash = XXH64(key.data(), key.size(), 19260817);
+  auto hash = XXH64(key.data(), key.size(), 19990315);
   return hash % cores.size();
 }
 
 uringpp::task<std::optional<std::string>> xcore_query(std::string_view key) {
   auto core = get_core(key);
   if (core == shard_id) {
-    auto it = kvs_.find(key);
-    if (it != kvs_.end()) {
+    auto it = kvs_->find(key);
+    if (it != kvs_->end()) {
       co_return it->second;
     }
     co_return std::nullopt;
@@ -160,8 +199,8 @@ uringpp::task<std::optional<std::string>> xcore_query(std::string_view key) {
   auto original_shard_id = shard_id;
   co_await loops[core]->switch_to_io_thread(original_shard_id);
   auto ret = [&]() -> std::optional<std::string> {
-    auto it = kvs_.find(key);
-    if (it != kvs_.end()) {
+    auto it = kvs_->find(key);
+    if (it != kvs_->end()) {
       return it->second;
     }
     return std::nullopt;
@@ -170,109 +209,118 @@ uringpp::task<std::optional<std::string>> xcore_query(std::string_view key) {
   co_return ret;
 }
 
+void xcore_add_local(std::string_view key, std::string_view value) {
+  kvs_->insert({std::string(key), std::string(value)});
+  kv_db_->Put(rocksdb::WriteOptions(), key, value);
+}
+
 uringpp::task<void> xcore_add(std::string_view key, std::string_view value) {
   auto core = get_core(key);
   if (core == shard_id) {
-    kvs_.insert({std::string(key), std::string(value)});
+    xcore_add_local(key, value);
     co_return;
   }
   auto original_shard_id = shard_id;
   co_await loops[core]->switch_to_io_thread(original_shard_id);
-  kvs_.insert({std::string(key), std::string(value)});
+  xcore_add_local(key, value);
   co_await loops[original_shard_id]->switch_to_io_thread(core);
+}
+
+void xcore_del_local(std::string_view key) {
+  {
+    auto it = kvs_->find(key);
+    if (it != kvs_->end()) {
+      kvs_->erase(it);
+    }
+    kv_db_->Delete(write_options, key);
+  }
+  {
+    auto it = zsets_->find(key);
+    if (it != zsets_->end()) {
+      zsets_->erase(it);
+    }
+  }
 }
 
 uringpp::task<void> xcore_del(std::string_view key) {
   auto core = get_core(key);
   if (core == shard_id) {
-    {
-      auto it = kvs_.find(key);
-      if (it != kvs_.end()) {
-        kvs_.erase(it);
-      }
-    }
-    {
-      auto it = zsets_.find(key);
-      if (it != zsets_.end()) {
-        zsets_.erase(it);
-      }
-    }
+    xcore_del_local(key);
     co_return;
   }
   auto original_shard_id = shard_id;
   co_await loops[core]->switch_to_io_thread(original_shard_id);
-  {
-    auto it = kvs_.find(key);
-    if (it != kvs_.end()) {
-      kvs_.erase(it);
-    }
-  }
-  {
-    auto it = zsets_.find(key);
-    if (it != zsets_.end()) {
-      zsets_.erase(it);
-    }
-  }
+  xcore_del_local(key);
   assert(original_shard_id < loops.size());
   assert(core < loops.size());
   co_await loops[original_shard_id]->switch_to_io_thread(core);
+}
+
+void xcore_zadd_local(std::string_view key, std::string_view value,
+                      uint32_t score) {
+  auto it = zsets_->find(key);
+  if (it == zsets_->end()) {
+    it = zsets_->insert({std::string(key), std::make_unique<zset_stl>()}).first;
+  }
+  it->second->zadd(score, value);
+  auto full_key = encode_zset_key(key, value);
+  zset_db_->Put(write_options, rocksdb::Slice(full_key.data(), full_key.size()),
+                rocksdb::Slice((char *)&score, sizeof(score)));
 }
 
 uringpp::task<void> xcore_zadd(std::string_view key, std::string_view value,
                                uint32_t score) {
   auto core = get_core(key);
   if (core == shard_id) {
-    auto it = zsets_.find(key);
-    if (it == zsets_.end()) {
-      it =
-          zsets_.insert({std::string(key), std::make_unique<zset_stl>()}).first;
-    }
-    it->second->zadd(score, value);
+    xcore_zadd_local(key, value, score);
     co_return;
   }
   auto original_shard_id = shard_id;
   co_await loops[core]->switch_to_io_thread(original_shard_id);
-  auto it = zsets_.find(key);
-  if (it == zsets_.end()) {
-    it = zsets_.insert({std::string(key), std::make_unique<zset_stl>()}).first;
-  }
-  it->second->zadd(score, value);
+  xcore_zadd_local(key, value, score);
   co_await loops[original_shard_id]->switch_to_io_thread(core);
 }
 
-uringpp::task<void> xcore_zrmv(std::string_view key, std::string_view value) {
-  auto core = get_core(key);
-  if (core == shard_id) {
-    auto it = zsets_.find(key);
-    if (it != zsets_.end()) {
-      auto score = it->second->value_score.find(value);
-      assert(score != it->second->value_score.end());
-      auto &score_values = it->second->score_values[score->second];
-      score_values.erase(score_values.find(value));
-      it->second->value_score.erase(score);
-    }
-    co_return;
-  }
-  auto original_shard_id = shard_id;
-  co_await loops[core]->switch_to_io_thread(original_shard_id);
-  auto it = zsets_.find(key);
-  if (it != zsets_.end()) {
+void xcore_zrmv_local(std::string_view key, std::string_view value) {
+  auto it = zsets_->find(key);
+  if (it != zsets_->end()) {
     auto score = it->second->value_score.find(value);
     assert(score != it->second->value_score.end());
     auto &score_values = it->second->score_values[score->second];
     score_values.erase(score_values.find(value));
     it->second->value_score.erase(score);
   }
+  auto full_key = encode_zset_key(key, value);
+  zset_db_->Delete(write_options,
+                   rocksdb::Slice(full_key.data(), full_key.size()));
+}
+
+uringpp::task<void> xcore_zrmv(std::string_view key, std::string_view value) {
+  auto core = get_core(key);
+  if (core == shard_id) {
+    xcore_zrmv_local(key, value);
+    co_return;
+  }
+  auto original_shard_id = shard_id;
+  co_await loops[core]->switch_to_io_thread(original_shard_id);
+  xcore_zrmv_local(key, value);
   co_await loops[original_shard_id]->switch_to_io_thread(core);
+}
+
+void xcore_batch_local(std::vector<key_value_view> const &kvs) {
+  auto write_batch = rocksdb::WriteBatch();
+  for (auto const kv : kvs) {
+    kvs_->insert({std::string(kv.key), std::string(kv.value)});
+    write_batch.Put(kv.key, kv.value);
+  }
+  kv_db_->Write(write_options, &write_batch);
 }
 
 uringpp::task<void> xcore_batch_remote(std::vector<key_value_view> const &kvs,
                                        size_t from_shard_id,
                                        size_t target_shard_id) {
   co_await loops[target_shard_id]->switch_to_io_thread(from_shard_id);
-  for (auto const kv : kvs) {
-    kvs_.insert({std::string(kv.key), std::string(kv.value)});
-  }
+  xcore_batch_local(kvs);
   co_await loops[from_shard_id]->switch_to_io_thread(target_shard_id);
 }
 
@@ -292,9 +340,7 @@ uringpp::task<void> xcore_batch(std::vector<key_value_view> const &kvs) {
           xcore_batch_remote(kvs_per_core[i], original_shard_id, i));
     }
   }
-  for (auto const kv : kvs_per_core[shard_id]) {
-    kvs_.insert({std::string(kv.key), std::string(kv.value)});
-  }
+  xcore_batch_local(kvs_per_core[shard_id]);
   for (auto &task : tasks) {
     co_await task;
   }
@@ -306,8 +352,8 @@ xcore_list_remote(std::vector<std::string_view> const &keys,
   co_await loops[target_shard_id]->switch_to_io_thread(from_shard_id);
   std::vector<key_view_value> result;
   for (auto const key : keys) {
-    auto it = kvs_.find(key);
-    if (it != kvs_.end()) {
+    auto it = kvs_->find(key);
+    if (it != kvs_->end()) {
       result.push_back({key, it->second});
     }
   }
@@ -336,8 +382,8 @@ uringpp::task<std::vector<std::vector<key_view_value>>> xcore_list(It begin,
   std::vector<std::vector<key_view_value>> result;
   result.push_back({});
   for (auto const key : keys_per_core[shard_id]) {
-    auto it = kvs_.find(key);
-    if (it != kvs_.end()) {
+    auto it = kvs_->find(key);
+    if (it != kvs_->end()) {
       result.back().emplace_back(key, it->second);
     }
   }
@@ -352,8 +398,8 @@ uringpp::task<std::optional<std::vector<score_value>>>
 xcore_zrange(std::string_view key, uint32_t min_score, uint32_t max_score) {
   auto core = get_core(key);
   if (core == shard_id) {
-    auto it = zsets_.find(key);
-    if (it == zsets_.end()) {
+    auto it = zsets_->find(key);
+    if (it == zsets_->end()) {
       co_return std::nullopt;
     }
     auto const &score_values = it->second->score_values;
@@ -368,8 +414,8 @@ xcore_zrange(std::string_view key, uint32_t min_score, uint32_t max_score) {
   }
   auto original_shard_id = shard_id;
   co_await loops[core]->switch_to_io_thread(original_shard_id);
-  auto it = zsets_.find(key);
-  if (it == zsets_.end()) {
+  auto it = zsets_->find(key);
+  if (it == zsets_->end()) {
     co_await loops[original_shard_id]->switch_to_io_thread(core);
     co_return std::nullopt;
   }
@@ -1127,7 +1173,12 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
         } break;
         case 'i': {
           // init
-          co_await send_all(conn, OK_RESPONSE, sizeof(OK_RESPONSE) - 1);
+          if (kv_initialized_) {
+            co_await send_all(conn, OK_RESPONSE, sizeof(OK_RESPONSE) - 1);
+          } else {
+            co_await send_all(conn, LOADING_RESPONSE,
+                              sizeof(LOADING_RESPONSE) - 1);
+          }
         } break;
         case 'q': {
           // query
@@ -1207,7 +1258,16 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
               fmt::print("RPC client connected\n");
             }
           }
-
+          {
+            bool init = false;
+            if (kv_initializing_.compare_exchange_strong(init, true)) {
+              auto load_thread = std::thread([]() {
+                enable_on_cores(cores);
+                init_load();
+              });
+              load_thread.detach();
+            }
+          }
           co_await send_all(conn, OK_RESPONSE, sizeof(OK_RESPONSE) - 1);
         } break;
         case 'a': {
@@ -1435,6 +1495,17 @@ task<void> http_server(std::shared_ptr<loop_with_queue> loop) {
   }
 }
 
+task<void> db_flusher() {
+  auto loop = loops[shard_id];
+  rocksdb::FlushOptions flush_options;
+  for (;;) {
+    struct __kernel_timespec ts = {0, 500000000};
+    co_await loop->timeout(&ts);
+    kv_db_->Flush(flush_options);
+    zset_db_->Flush(flush_options);
+  }
+}
+
 task<void> connect_rpc_client(std::string port) {
   (void)loop_started.load();
   try {
@@ -1483,11 +1554,160 @@ task<void> connect_rpc_client(std::string port) {
   }
 }
 
+static inline rocksdb::Options get_open_options() {
+  rocksdb::Options options;
+  options.create_if_missing = true;
+  options.allow_mmap_reads = true;
+  options.allow_mmap_writes = true;
+  options.use_adaptive_mutex = true;
+  options.unordered_write = true;
+  options.enable_write_thread_adaptive_yield = true;
+  options.write_buffer_size = 256 * 1024 * 1024;
+  options.DisableExtraChecks();
+  return options;
+}
+
+static inline rocksdb::ReadOptions get_bulk_read_options() {
+  rocksdb::ReadOptions read_options;
+  read_options.verify_checksums = false;
+  read_options.fill_cache = false;
+  read_options.readahead_size = 128 * 1024 * 1024;
+  read_options.async_io = true;
+  return read_options;
+}
+
+void init_load() {
+  char *init_dirs_env = std::getenv("INIT_DIRS");
+  if (init_dirs_env == nullptr) {
+    kv_initialized_ = true;
+    return;
+  }
+  write_options.disableWAL = true;
+  std::vector<std::string> init_dirs;
+  boost::split(init_dirs, init_dirs_env, boost::is_any_of(","));
+  std::vector<std::vector<std::string>> ssts;
+  std::mutex sst_m;
+  std::chrono::steady_clock::time_point start =
+      std::chrono::steady_clock::now();
+  std::atomic<size_t> key_count;
+  {
+    std::vector<std::thread> threads;
+    for (auto dir : init_dirs) {
+      rocksdb::DB *load_db;
+      auto status =
+          rocksdb::DB::OpenForReadOnly(get_open_options(), dir, &load_db);
+      if (!status.ok()) {
+        continue;
+      }
+      threads.emplace_back([load_db, dir, &sst_m, &ssts, &key_count]() {
+        size_t count = 0;
+        std::vector<rocksdb::SstFileWriter *> writers;
+        std::vector<std::string> sst_paths;
+        for (size_t i = 0; i < cores.size(); ++i) {
+          writers.push_back(new rocksdb::SstFileWriter(rocksdb::EnvOptions(),
+                                                       get_open_options()));
+          auto sst_path =
+              std::filesystem::path(dir) / fmt::format("load-{}.sst", i);
+          auto status = writers[i]->Open(sst_path.string());
+          if (!status.ok()) {
+            fmt::print("Failed to open SST file {}: {}\n", sst_path.string(),
+                       status.ToString());
+            return;
+          }
+          sst_paths.push_back(sst_path.string());
+          std::vector<char> zero(1, '\0');
+          writers[i]->Put(rocksdb::Slice(zero.data(), zero.size()),
+                          rocksdb::Slice(zero.data(), zero.size()));
+        }
+        auto it = load_db->NewIterator(get_bulk_read_options());
+        for (it->SeekToFirst(); it->Valid(); it->Next()) {
+          auto key = it->key();
+          auto value = it->value();
+          auto key_sv = key.ToStringView();
+          auto value_sv = value.ToStringView();
+          if (get_shard(key_sv) == me) {
+            auto core = get_core(key_sv);
+            writers[core]->Put(key_sv, value_sv);
+            {
+              mutable_pair<std::string, std::string> new_kv{
+                  std::string(key_sv), std::string(value_sv)};
+              std::lock_guard lk(*init_locks_[core]);
+              kv_shards_[core]->insert(std::move(new_kv));
+            }
+            count++;
+          }
+        }
+        delete it;
+        delete load_db;
+        for (auto writer : writers) {
+          auto status = writer->Finish();
+          if (!status.ok()) {
+            fmt::print("Failed to finish SST file: {}\n", status.ToString());
+          }
+          delete writer;
+        }
+        {
+          std::lock_guard lock(sst_m);
+          ssts.push_back(sst_paths);
+        }
+        key_count += count;
+      });
+    }
+    for (auto &t : threads) {
+      t.join();
+    }
+  }
+  rocksdb::IngestExternalFileOptions ingest_options;
+  ingest_options.move_files = true;
+  ingest_options.snapshot_consistency = false;
+  ingest_options.allow_global_seqno = true;
+  for (size_t core = 0; core < cores.size(); ++core) {
+    std::vector<std::string> this_shard_ssts;
+    for (auto &sst_paths : ssts) {
+      this_shard_ssts.push_back(sst_paths[core]);
+    }
+    auto status = kv_db_shards_[core]->IngestExternalFile(this_shard_ssts,
+                                                          ingest_options);
+    if (!status.ok()) {
+      fmt::print("Failed to ingest SST files: {}\n", status.ToString());
+    }
+  }
+  kv_initialized_.store(true);
+  fmt::print("Loaded {} keys\n", key_count);
+}
+
 int main(int argc, char *argv[]) {
   shard_id = 0;
   cores = get_cpu_affinity();
   loops.resize(cores.size());
-  init_ok.resize(cores.size(), false);
+  kv_shards_.resize(cores.size());
+  zset_shards_.resize(cores.size());
+  kv_db_shards_.resize(cores.size());
+  zset_db_shards_.resize(cores.size());
+  init_locks_.resize(cores.size());
+  for (size_t i = 0; i < cores.size(); ++i) {
+    init_locks_[i] = new std::mutex();
+    kv_shards_[i] = new unordered_string_map<std::string>();
+    zset_shards_[i] = new unordered_string_map<std::unique_ptr<zset_stl>>();
+    rocksdb::DB *kv_db;
+    rocksdb::DB *zset_db;
+    auto kv_db_path = fmt::format("/data/{}/kv", i);
+    std::filesystem::create_directories(kv_db_path);
+    auto zset_db_path = fmt::format("/data/{}/zset", i);
+    std::filesystem::create_directories(zset_db_path);
+    auto status = rocksdb::DB::Open(get_open_options(), kv_db_path, &kv_db);
+    if (!status.ok()) {
+      fmt::print("Failed to open kv db {}\n", status.ToString());
+      exit(1);
+    }
+    kv_db_shards_[i] = kv_db;
+    status = rocksdb::DB::Open(get_open_options(), zset_db_path, &zset_db);
+    if (!status.ok()) {
+      fmt::print("Failed to open zset db {}\n", status.ToString());
+      exit(1);
+    }
+    zset_db_shards_[i] = zset_db;
+  }
   main_loop = loop_with_queue::create(cores.size(), 4096);
   main_loop->waker();
   ::signal(SIGPIPE, SIG_IGN);
@@ -1495,12 +1715,43 @@ int main(int argc, char *argv[]) {
   for (int i = 0; i < cores.size(); ++i) {
     auto thread = std::thread([i, core = cores[i]] {
       shard_id = i;
+      kvs_ = kv_shards_[i];
+      zsets_ = zset_shards_[i];
+      kv_db_ = kv_db_shards_[i];
+      zset_db_ = zset_db_shards_[i];
       fmt::print("thread {} bind to core {}\n", i, core);
       bind_cpu(core);
+      {
+        auto count = 0;
+        auto it = std::unique_ptr<rocksdb::Iterator>(
+            kv_db_->NewIterator(get_bulk_read_options()));
+        for (it->SeekToFirst(); it->Valid(); it->Next()) {
+          auto key = it->key();
+          auto value = it->value();
+          kvs_->insert({key.ToString(), value.ToString()});
+          count++;
+        }
+        fmt::print("shard {} kv count: {}\n", shard_id, count);
+      }
+      {
+        auto it = std::unique_ptr<rocksdb::Iterator>(
+            zset_db_->NewIterator(get_bulk_read_options()));
+        auto count = 0;
+        for (it->SeekToFirst(); it->Valid(); it->Next()) {
+          auto full_key = it->key();
+          auto score_raw = it->value();
+          auto score = *reinterpret_cast<uint32_t const *>(score_raw.data());
+          auto [key, value] = decode_zset_key(full_key);
+          xcore_zadd_local(key, value, score);
+          count++;
+        }
+        fmt::print("shard {} zset count: {}\n", shard_id, count);
+      }
       auto loop = loop_with_queue::create(cores.size(), 8192);
       loops[i] = loop;
       loop_started.fetch_add(1);
       loop->waker();
+      db_flusher().detach();
       for (;;) {
         loop->poll();
       }
