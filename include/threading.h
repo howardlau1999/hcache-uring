@@ -38,7 +38,9 @@ public:
 
   thread_switch_awaitable queue_in_loop() { return {*this}; }
 
-  void push(std::coroutine_handle<> h) { queue_.push(h); }
+  void push(std::coroutine_handle<> h) {
+    queue_.push(h);
+  }
 
   template <class F> void consume_one(F &&fn) { queue_.consume_one(fn); }
 
@@ -103,7 +105,7 @@ public:
   }
 
   void run_pending(size_t shard_id) {
-    constexpr size_t run_task_limit = 256;
+    constexpr size_t run_task_limit = 1024;
     size_t count = 0;
     auto &q = queues_[shard_id];
     while (!q.empty()) {

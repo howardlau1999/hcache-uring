@@ -81,8 +81,10 @@ std::chrono::steady_clock::time_point now() {
   return std::chrono::steady_clock::now();
 }
 
-bool exceed_quota(std::chrono::steady_clock::time_point const &start) {
-  return now() - start > task_quota;
+constexpr bool
+exceed_quota(std::chrono::steady_clock::time_point const &start) {
+  // return now() - start > task_quota;
+  return false;
 }
 
 template <size_t align> constexpr size_t align_up(const uint64_t size) {
@@ -97,7 +99,7 @@ struct send_conn_state {
 task<void> rpc_reply_recv_loop(uringpp::socket &rpc_conn);
 
 struct conn_pool {
-  static constexpr size_t kMaxConns = 128;
+  static constexpr size_t kMaxConns = 256;
   std::shared_ptr<loop_with_queue> loop;
   std::queue<std::coroutine_handle<>> waiters;
   std::string host;
@@ -518,6 +520,8 @@ uringpp::task<void> writev_all(uringpp::socket &conn, struct iovec *iov,
   while (written < total) {
     auto n = co_await conn.writev(iov, iovcnt);
     if (n <= 0) {
+      fmt::print("written {} total {}\n", written, total);
+      throw std::runtime_error("writev_all failed");
       break;
     }
     written += n;
@@ -628,7 +632,7 @@ task<void> handle_rpc(uringpp::socket conn, size_t conn_id) {
         p += sizeof(m);
         req_size = *reinterpret_cast<uint32_t *>(p);
         p += sizeof(req_size);
-        request.advance_read(p - request.read_data());
+        request.advance_read(kRPCRequestHeaderSize);
         state = kStateRecvBody;
         if (req_size > request.writable()) {
           request.expand(req_size - request.writable());
@@ -637,13 +641,16 @@ task<void> handle_rpc(uringpp::socket conn, size_t conn_id) {
         request.expand(kRPCRequestHeaderSize - request.writable());
       }
     }
+
     if (state == kStateRecvBody) {
       if (request.readable() >= req_size) {
         state = kStateProcess;
       }
     }
+
     if (state != kStateProcess) {
-      auto n = co_await conn.recv(request.write_data(), request.writable());
+      auto n = co_await conn.recv(request.write_data(), request.writable(),
+                                  MSG_NOSIGNAL);
       if (n <= 0) {
         fmt::print("recv error: {} writable {}\n", n, request.writable());
         co_return;
@@ -686,16 +693,16 @@ task<void> handle_rpc(uringpp::socket conn, size_t conn_id) {
       req_p += sizeof(value_size);
       std::string_view value(req_p, value_size);
       req_p += value_size_align;
-      co_await xcore_add(key, value);
       co_await rpc_reply(conn, req_id, {});
+      co_await xcore_add(key, value);
     } break;
     case method::del: {
       uint32_t key_size = *reinterpret_cast<uint32_t *>(req_p);
       req_p += sizeof(key_size);
       std::string_view key(req_p, key_size);
       req_p += key_size;
-      co_await xcore_del(key);
       co_await rpc_reply(conn, req_id, {});
+      co_await xcore_del(key);
     } break;
     case method::list: {
       uint32_t key_count = *reinterpret_cast<uint32_t *>(req_p);
@@ -718,10 +725,8 @@ task<void> handle_rpc(uringpp::socket conn, size_t conn_id) {
               sizeof(uint32_t) * 2 + kv.key.size() + kv.value.size();
         }
       }
-      assert(rep_body_size % sizeof(uint32_t) == 0);
-      auto rep_body = std::vector<char>(rep_body_size);
-      co_await rpc_reply_header(conn, req_id, rep_body.size(), total_count);
-      constexpr size_t batch_size = 32;
+      co_await rpc_reply_header(conn, req_id, rep_body_size, total_count);
+      constexpr size_t batch_size = 256;
       uint32_t sizes[batch_size * 2];
       struct iovec iov[batch_size * 4];
       size_t batch_idx = 0;
@@ -815,7 +820,7 @@ task<void> handle_rpc(uringpp::socket conn, size_t conn_id) {
           rep_body_size += sizeof(uint32_t) * 2 + v.value.size();
         }
         co_await rpc_reply_header(conn, req_id, rep_body_size, values->size());
-        constexpr size_t batch_size = 32;
+        constexpr size_t batch_size = 340;
         struct iovec iov[batch_size * 3];
         size_t batch_idx = 0;
         uint32_t sizes[batch_size];
@@ -841,6 +846,7 @@ task<void> handle_rpc(uringpp::socket conn, size_t conn_id) {
     request.advance_read(req_size);
     state = kStateRecvHeader;
     req_size = 0;
+    req_id = 0;
   }
 }
 
@@ -932,7 +938,7 @@ task<void> remote_del(conn_pool &pool, std::string_view key) {
 
 task<void> send_batch_kv(send_conn_state *state, conn_pool &pool,
                          std::vector<key_value_view> const &kvs) {
-  constexpr size_t batch_size = 32;
+  constexpr size_t batch_size = 256;
   uint32_t sizes[batch_size * 2];
   struct iovec iov[batch_size * 4];
   size_t batch_idx = 0;
@@ -1183,6 +1189,7 @@ task<void> rpc_reply_recv_loop(uringpp::socket &rpc_conn) {
     delete pending;
     state = kStateRecvHeader;
     rep_size = 0;
+    req_id = 0;
   }
 }
 
@@ -1287,7 +1294,11 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
         assert(request.writable() > 0);
         n = co_await conn.recv(request.write_data(), request.writable(),
                                MSG_NOSIGNAL);
-        if (n <= 0) {
+        if (n <= 0) [[unlikely]] {
+          if (n < 0) {
+            fmt::print("{} {} recv error: {}\n", shard_id, conn_id,
+                       strerror(-n));
+          }
           co_return;
         }
         request.advance_write(n);
@@ -1495,7 +1506,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
               rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
               d.Accept(writer);
             };
-            constexpr size_t batch_size = 16;
+            constexpr size_t batch_size = 511;
             bool first = true;
             char left_bracket = '[';
             char comma = ',';
@@ -1506,7 +1517,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
             const char chunk_end[] = "\r\n";
             struct iovec iov[batch_size * 2 + 2];
             iov[0].iov_base = chunk_length;
-            auto send_batch_chunk = [&]() -> task<void> {
+            auto send_kv_chunk = [&]() -> task<void> {
               for (size_t i = 0; i < batch_idx; ++i) {
                 if (first) {
                   first = false;
@@ -1536,7 +1547,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
               for (auto &kv : core_kv) {
                 write_kv(buffer[batch_idx], kv.key, kv.value);
                 if (++batch_idx == batch_size) {
-                  co_await send_batch_chunk();
+                  co_await send_kv_chunk();
                 }
               }
             }
@@ -1544,12 +1555,12 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
               for (auto &kv : remote_kv) {
                 write_kv(buffer[batch_idx], kv.key, kv.value);
                 if (++batch_idx == batch_size) {
-                  co_await send_batch_chunk();
+                  co_await send_kv_chunk();
                 }
               }
             }
             if (batch_idx > 0) {
-              co_await send_batch_chunk();
+              co_await send_kv_chunk();
             }
             co_await send_all(conn, CHUNK_END, sizeof(CHUNK_END) - 1);
           }
@@ -1593,7 +1604,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
               rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
               d.Accept(writer);
             };
-            constexpr size_t batch_size = 16;
+            constexpr size_t batch_size = 511;
             bool first = true;
             char left_bracket = '[';
             char comma = ',';
@@ -1929,7 +1940,7 @@ int main(int argc, char *argv[]) {
     }
     zset_db_shards_[i] = zset_db;
   }
-  main_loop = loop_with_queue::create(cores.size(), 4096);
+  main_loop = loop_with_queue::create(cores.size(), 16384);
   main_loop->waker();
   ::signal(SIGPIPE, SIG_IGN);
   bind_cpu(cores[0]);
@@ -1968,13 +1979,13 @@ int main(int argc, char *argv[]) {
         }
         fmt::print("shard {} zset count: {}\n", shard_id, count);
       }
-      auto loop = loop_with_queue::create(cores.size(), 8192);
+      auto loop = loop_with_queue::create(cores.size(), 16384);
       loops[i] = loop;
       loop_started.fetch_add(1);
       loop->waker();
       db_flusher().detach();
       for (;;) {
-        loop->poll();
+        loop->poll_no_wait();
       }
     });
     thread.detach();
