@@ -105,7 +105,7 @@ public:
   }
 
   void run_pending(size_t shard_id) {
-    constexpr size_t run_task_limit = 1024;
+    constexpr size_t run_task_limit = 128;
     size_t count = 0;
     auto &q = queues_[shard_id];
     while (!q.empty()) {
