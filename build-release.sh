@@ -10,7 +10,7 @@ if ! [ -d ../boost ]; then
   cd ../boost
   ./bootstrap.sh --with-toolset="clang"
   ./b2 install toolset=clang cxxflags="-stdlib=libc++" linkflags="-stdlib=libc++"
-  cd hcache-uring
+  cd ../hcache-uring
 fi
 
 if ! [ -d ../liburing ]; then
@@ -19,7 +19,7 @@ if ! [ -d ../liburing ]; then
   CC=clang CXX=clang++ ./configure
   make -j$(nproc)
   make install
-  cd hcache-uring
+  cd ../hcache-uring
 fi 
 
 CXX=clang++ CC=clang cmake -Bbuild -DCMAKE_BUILD_TYPE=Release -GNinja .
