@@ -295,10 +295,10 @@ constexpr size_t kRPCRequestHeaderSize =
 
 task<void> recv_n(uringpp::socket &conn, io_buffer &buf, size_t n) {
   if (buf.writable() < n) {
-    buf.expand(n - buf.writable());
+    buf.expand(n * 2);
   }
   while (buf.readable() < n) {
-    int recved = co_await conn.recv(buf.write_data(), n - buf.readable());
+    int recved = co_await conn.recv(buf.write_data(), buf.writable());
     if (recved <= 0) {
       throw std::runtime_error("connection closed");
     }
@@ -308,7 +308,6 @@ task<void> recv_n(uringpp::socket &conn, io_buffer &buf, size_t n) {
 
 task<std::vector<key_value>>
 stream_recv_list_rpc(uringpp::socket &conn, size_t req_size, io_buffer &buf) {
-
   if (req_size == 0) {
     co_return {};
   }
