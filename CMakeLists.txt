@@ -15,7 +15,7 @@ ExternalProject_Add(rocksdb_src
     URL ${CMAKE_CURRENT_LIST_DIR}/third_party/rocksdb
     BUILD_IN_SOURCE 1
     CONFIGURE_COMMAND ""
-    BUILD_COMMAND make -j${N} static_lib
+    BUILD_COMMAND ${CMAKE_COMMAND} -E env ${ROCKSDB_USE_CLANG} make -j${N} static_lib
     INSTALL_COMMAND ""
     BUILD_BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/rocksdb/src/rocksdb_src/librocksdb.a"
 )
