@@ -314,6 +314,63 @@ task<void> recv_n(uringpp::socket &conn, io_buffer &buf, size_t n) {
   }
 }
 
+task<std::vector<key_value>>
+stream_recv_list_rpc(uringpp::socket &conn, size_t req_size, io_buffer &buf) {
+
+  if (req_size == 0) {
+    co_return {};
+  }
+  std::vector<key_value> result;
+  co_await recv_n(conn, buf, sizeof(uint32_t));
+  auto count = *(uint32_t *)buf.read_data();
+  buf.advance_read(sizeof(uint32_t));
+
+  for (size_t i = 0; i < count; i++) {
+    co_await recv_n(conn, buf, sizeof(uint32_t));
+    auto len = *(uint32_t *)buf.read_data();
+    buf.advance_read(sizeof(uint32_t));
+
+    co_await recv_n(conn, buf, len);
+    auto key = std::string(buf.read_data(), len);
+    buf.advance_read(len);
+    auto value = store->query(key);
+    if (value.first) {
+      result.push_back({key, std::string(value.first, value.second)});
+    }
+  }
+  co_return result;
+}
+
+task<void> stream_recv_batch_rpc(uringpp::socket &conn, size_t req_size,
+                                 io_buffer &buf) {
+  if (req_size == 0) {
+    co_return;
+  }
+  co_await recv_n(conn, buf, sizeof(uint32_t));
+  auto count = *(uint32_t *)buf.read_data();
+  buf.advance_read(sizeof(uint32_t));
+
+  for (size_t i = 0; i < count; i++) {
+    co_await recv_n(conn, buf, sizeof(uint32_t));
+    auto len = *(uint32_t *)buf.read_data();
+    buf.advance_read(sizeof(uint32_t));
+
+    co_await recv_n(conn, buf, len);
+    auto key = std::string(buf.read_data(), len);
+    buf.advance_read(len);
+
+    co_await recv_n(conn, buf, sizeof(uint32_t));
+    len = *(uint32_t *)buf.read_data();
+    buf.advance_read(sizeof(uint32_t));
+
+    co_await recv_n(conn, buf, len);
+    auto value = std::string(buf.read_data(), len);
+    buf.advance_read(len);
+
+    store->add(key, value);
+  }
+}
+
 task<void> handle_rpc(uringpp::socket conn, size_t conn_id) {
   auto loop = rpc_loops[conn_id % rpc_loops.size()];
   co_await loop->switch_to_io_thread();
@@ -336,6 +393,44 @@ task<void> handle_rpc(uringpp::socket conn, size_t conn_id) {
         state = kStateRecvBody;
         if (req_size > request.writable()) {
           request.expand(req_size - request.writable());
+        }
+        if (m == method::batch) {
+          co_await stream_recv_batch_rpc(conn, req_size, request);
+          co_await rpc_reply(conn, req_id, {});
+          state = kStateRecvHeader;
+          continue;
+        } else if (m == method::list) {
+          auto values = co_await stream_recv_list_rpc(conn, req_size, request);
+          size_t rep_body_size = sizeof(uint32_t);
+          for (auto &v : values) {
+            rep_body_size +=
+                sizeof(uint32_t) * 2 + v.key.size() + v.value.size();
+          }
+          co_await rpc_reply_header(conn, req_id, rep_body_size);
+          auto rep_body = std::vector<char>(rep_body_size);
+          auto p = &rep_body[0];
+          auto last_write_cursor = p;
+          *reinterpret_cast<uint32_t *>(p) = values.size();
+          p += sizeof(uint32_t);
+          for (auto &v : values) {
+            *reinterpret_cast<uint32_t *>(p) = v.key.size();
+            p += sizeof(uint32_t);
+            std::copy_n(v.key.data(), v.key.size(), p);
+            p += v.key.size();
+            *reinterpret_cast<uint32_t *>(p) = v.value.size();
+            p += sizeof(uint32_t);
+            std::copy_n(v.value.data(), v.value.size(), p);
+            p += v.value.size();
+            if (p - last_write_cursor > 256 * 1024) {
+              co_await send_all(conn, last_write_cursor, p - last_write_cursor);
+              last_write_cursor = p;
+            }
+          }
+          if (p - last_write_cursor > 0) {
+            co_await send_all(conn, last_write_cursor, p - last_write_cursor);
+          }
+          state = kStateRecvHeader;
+          continue;
         }
       } else if (request.writable() < kRPCRequestHeaderSize) {
         request.expand(kRPCRequestHeaderSize - request.writable());
@@ -396,62 +491,6 @@ task<void> handle_rpc(uringpp::socket conn, size_t conn_id) {
       req_p += key_size;
       co_await rpc_reply(conn, req_id, {});
       store->del(key);
-    } break;
-    case method::list: {
-      uint32_t key_count = *reinterpret_cast<uint32_t *>(req_p);
-      req_p += sizeof(key_count);
-      std::vector<std::string_view> keys;
-      for (uint32_t i = 0; i < key_count; i++) {
-        uint32_t key_size = *reinterpret_cast<uint32_t *>(req_p);
-        req_p += sizeof(key_size);
-        std::string_view key(req_p, key_size);
-        req_p += key_size;
-        keys.push_back(key);
-      }
-      auto values = store->list(keys.begin(), keys.end());
-      size_t rep_body_size = sizeof(uint32_t);
-      for (auto &v : values) {
-        rep_body_size += sizeof(uint32_t) * 2 + v.key.size() + v.value.size();
-      }
-      co_await rpc_reply_header(conn, req_id, rep_body_size);
-      auto rep_body = std::vector<char>(rep_body_size);
-      auto p = &rep_body[0];
-      auto last_write_cursor = p;
-      *reinterpret_cast<uint32_t *>(p) = values.size();
-      p += sizeof(uint32_t);
-      for (auto &v : values) {
-        *reinterpret_cast<uint32_t *>(p) = v.key.size();
-        p += sizeof(uint32_t);
-        std::copy_n(v.key.data(), v.key.size(), p);
-        p += v.key.size();
-        *reinterpret_cast<uint32_t *>(p) = v.value.size();
-        p += sizeof(uint32_t);
-        std::copy_n(v.value.data(), v.value.size(), p);
-        p += v.value.size();
-        if (p - last_write_cursor > 256 * 1024) {
-          co_await send_all(conn, last_write_cursor, p - last_write_cursor);
-          last_write_cursor = p;
-        }
-      }
-      if (p - last_write_cursor > 0) {
-        co_await send_all(conn, last_write_cursor, p - last_write_cursor);
-      }
-    } break;
-    case method::batch: {
-      uint32_t count = *reinterpret_cast<uint32_t *>(req_p);
-      co_await rpc_reply(conn, req_id, {});
-      req_p += sizeof(count);
-      for (uint32_t i = 0; i < count; i++) {
-        uint32_t key_size = *reinterpret_cast<uint32_t *>(req_p);
-        req_p += sizeof(key_size);
-        std::string_view key(req_p, key_size);
-        req_p += key_size;
-        uint32_t value_size = *reinterpret_cast<uint32_t *>(req_p);
-        req_p += sizeof(value_size);
-        std::string_view value(req_p, value_size);
-        req_p += value_size;
-        store->add(key, value);
-      }
     } break;
     case method::zadd: {
       uint32_t key_size = *reinterpret_cast<uint32_t *>(req_p);
@@ -519,6 +558,9 @@ task<void> handle_rpc(uringpp::socket conn, size_t conn_id) {
           co_await send_all(conn, last_write_cursor, p - last_write_cursor);
         }
       }
+    } break;
+    default: {
+      co_await rpc_reply(conn, req_id, {});
     } break;
     }
     request.advance_read(req_size);
