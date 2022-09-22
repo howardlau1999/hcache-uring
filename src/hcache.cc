@@ -99,7 +99,7 @@ struct send_conn_state {
 task<void> rpc_reply_recv_loop(uringpp::socket &rpc_conn);
 
 struct conn_pool {
-  static constexpr size_t kMaxConns = 256;
+  static constexpr size_t kMaxConns = 1024;
   std::shared_ptr<loop_with_queue> loop;
   std::queue<std::coroutine_handle<>> waiters;
   std::string host;
@@ -1985,7 +1985,7 @@ int main(int argc, char *argv[]) {
       loop->waker();
       db_flusher().detach();
       for (;;) {
-        loop->poll_no_wait();
+        loop->poll();
       }
     });
     thread.detach();
