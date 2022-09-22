@@ -2082,6 +2082,7 @@ int main(int argc, char *argv[]) {
           while (!persist_queue_[i]->empty()) {
             persist_queue_[i]->consume_one([](auto h) { h.resume(); });
           }
+          persist_queue_[i]->sleep();
         }
       });
       persist_thread.detach();
