@@ -41,10 +41,6 @@ using uringpp::task;
 
 struct send_conn_state {
   std::unique_ptr<uringpp::socket> conn;
-  std::list<output_page> send_buf;
-  std::list<output_page> pending_send_buf;
-  bool sending;
-  bool closed;
 };
 
 task<void> rpc_reply_recv_loop(uringpp::socket &rpc_conn);
@@ -82,11 +78,7 @@ struct conn_pool {
                  sizeof(flags));
     }
     auto state = new send_conn_state{
-        std::make_unique<uringpp::socket>(std::move(rpc_conn)),
-        {},
-        {},
-        false,
-        false};
+        std::make_unique<uringpp::socket>(std::move(rpc_conn))};
 
     rpc_reply_recv_loop(*state->conn).detach();
     co_return state;
@@ -1578,14 +1570,10 @@ int main(int argc, char *argv[]) {
   store = std::make_unique<storage>();
   {
     auto kv_thread = std::jthread([]() {
-      cds::threading::Manager::attachThread();
       store->load_kv();
-      cds::threading::Manager::detachThread();
     });
     auto zset_thread = std::jthread([]() {
-      cds::threading::Manager::attachThread();
       store->load_zset();
-      cds::threading::Manager::detachThread();
     });
   }
   auto flush_thread = std::thread([]() {
@@ -1600,7 +1588,6 @@ int main(int argc, char *argv[]) {
     auto thread = std::thread([i, core = cores[i]] {
       fmt::print("thread {} bind to core {}\n", i, core);
       bind_cpu(core);
-      cds::threading::Manager::attachThread();
       auto loop = loop_with_queue::create(32768, IORING_SETUP_ATTACH_WQ,
                                           main_loop->fd());
       loops[i] = loop;
@@ -1620,7 +1607,6 @@ int main(int argc, char *argv[]) {
     auto thread = std::thread([i, core = cores[i]] {
       fmt::print("RPC Thread {} bind to core {}\n", i, core);
       bind_cpu(core);
-      cds::threading::Manager::attachThread();
       auto loop = loop_with_queue::create(32768, IORING_SETUP_ATTACH_WQ,
                                           main_loop->fd());
       rpc_loops[i] = loop;
