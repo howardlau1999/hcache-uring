@@ -45,24 +45,24 @@ public:
   template <class F> void consume_one(F &&fn) { queue_.consume_one(fn); }
 
   void sleep() {
-    std::atomic_signal_fence(std::memory_order_seq_cst);
-    sleeping_.store(true, std::memory_order_relaxed);
+    // std::atomic_signal_fence(std::memory_order_seq_cst);
+    // sleeping_.store(true, std::memory_order_relaxed);
   }
 
   bool empty() const { return !queue_.read_available(); }
 
   void maybe_wakeup() {
-    std::atomic_signal_fence(std::memory_order_seq_cst);
-    if (sleeping_.load(std::memory_order_relaxed)) {
-      sleeping_.store(false, std::memory_order_relaxed);
-      wakeup(efd_);
-    }
+    // std::atomic_signal_fence(std::memory_order_seq_cst);
+    // if (sleeping_.load(std::memory_order_relaxed)) {
+    //   sleeping_.store(false, std::memory_order_relaxed);
+    //   wakeup(efd_);
+    // }
   }
 
   void wakeup(int efd) const {
-    uint64_t val = 1;
-    auto ret = ::write(efd, &val, sizeof(val));
-    assert(ret > 0);
+    // uint64_t val = 1;
+    // auto ret = ::write(efd, &val, sizeof(val));
+    // assert(ret > 0);
   }
 
   void set_efd(int efd) { efd_ = efd; }
@@ -99,26 +99,26 @@ public:
   }
 
   void waker() {
-    for (size_t i = 0; i < queues_.size(); ++i) {
-      waker_loop(i).detach();
-    }
+    // for (size_t i = 0; i < queues_.size(); ++i) {
+    //   waker_loop(i).detach();
+    // }
   }
 
   void run_pending(size_t shard_id) {
-    constexpr size_t run_task_limit = 128;
-    size_t count = 0;
+    // constexpr size_t run_task_limit = 128;
+    // size_t count = 0;
     auto &q = queues_[shard_id];
     while (!q.empty()) {
       q.consume_one([](std::coroutine_handle<> h) { h.resume(); });
-      if (++count == run_task_limit) {
-        break;
-      }
+      // if (++count == run_task_limit) {
+      //   break;
+      // }
     }
-    if (!q.empty()) {
-      q.wakeup(efds_[shard_id]);
-    } else {
-      q.sleep();
-    }
+    // if (!q.empty()) {
+    //   q.wakeup(efds_[shard_id]);
+    // } else {
+    //   q.sleep();
+    // }
   }
 
   io_queue::thread_switch_awaitable switch_to_io_thread(size_t from_shard) {

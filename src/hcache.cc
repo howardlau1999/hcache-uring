@@ -215,9 +215,8 @@ uringpp::task<std::optional<std::string>> xcore_query(std::string_view key) {
   co_return ret;
 }
 
-task<void> delay_add_persist(std::string key, std::string value) {
+void delay_add_persist(std::string key, std::string value) {
   auto kv_db = kv_db_shards_[shard_id];
-  co_await persist_queue_[shard_id]->queue_in_loop();
   kv_db->Put(rocksdb::WriteOptions(), key, value);
 }
 
@@ -227,7 +226,7 @@ void xcore_add_local_no_persist(std::string_view key, std::string_view value) {
 
 void xcore_add_local(std::string_view key, std::string_view value) {
   xcore_add_local_no_persist(key, value);
-  delay_add_persist(std::string(key), std::string(value)).detach();
+  delay_add_persist(std::string(key), std::string(value));
 }
 
 uringpp::task<void> xcore_add(std::string_view key, std::string_view value) {
@@ -242,9 +241,8 @@ uringpp::task<void> xcore_add(std::string_view key, std::string_view value) {
   co_await loops[original_shard_id]->switch_to_io_thread(core);
 }
 
-task<void> delay_del_persist(std::string key) {
+void delay_del_persist(std::string key) {
   auto kv_db = kv_db_;
-  co_await persist_queue_[shard_id]->queue_in_loop();
   kv_db->Delete(rocksdb::WriteOptions(), key);
 }
 
@@ -254,7 +252,7 @@ void xcore_del_local(std::string_view key) {
     if (it != kvs_->end()) {
       kvs_->erase(it);
     }
-    delay_del_persist(std::string(key)).detach();
+    delay_del_persist(std::string(key));
   }
   {
     auto it = zsets_->find(key);
@@ -278,9 +276,8 @@ uringpp::task<void> xcore_del(std::string_view key) {
   co_await loops[original_shard_id]->switch_to_io_thread(core);
 }
 
-task<void> delay_zadd_persist(std::vector<char> full_key, uint32_t score) {
+void delay_zadd_persist(std::vector<char> full_key, uint32_t score) {
   auto zset_db = zset_db_;
-  co_await persist_queue_[shard_id]->queue_in_loop();
   zset_db->Put(write_options, rocksdb::Slice(full_key.data(), full_key.size()),
                rocksdb::Slice((char *)&score, sizeof(score)));
 }
@@ -297,7 +294,7 @@ void xcore_zadd_local_no_persist(std::string_view key, std::string_view value,
 void xcore_zadd_local(std::string_view key, std::string_view value,
                       uint32_t score) {
   xcore_zadd_local_no_persist(key, value, score);
-  delay_zadd_persist(encode_zset_key(key, value), score).detach();
+  delay_zadd_persist(encode_zset_key(key, value), score);
 }
 
 uringpp::task<void> xcore_zadd(std::string_view key, std::string_view value,
@@ -313,9 +310,8 @@ uringpp::task<void> xcore_zadd(std::string_view key, std::string_view value,
   co_await loops[original_shard_id]->switch_to_io_thread(core);
 }
 
-task<void> delay_zrmv_persist(std::vector<char> full_key) {
+void delay_zrmv_persist(std::vector<char> full_key) {
   auto zset_db = zset_db_;
-  co_await persist_queue_[shard_id]->queue_in_loop();
   zset_db->Delete(write_options,
                   rocksdb::Slice(full_key.data(), full_key.size()));
 }
@@ -329,7 +325,7 @@ void xcore_zrmv_local(std::string_view key, std::string_view value) {
     score_values.erase(score_values.find(value));
     it->second->value_score.erase(score);
   }
-  delay_zrmv_persist(encode_zset_key(key, value)).detach();
+  delay_zrmv_persist(encode_zset_key(key, value));
 }
 
 uringpp::task<void> xcore_zrmv(std::string_view key, std::string_view value) {
@@ -2000,6 +1996,40 @@ void init_load() {
   fmt::print("Loaded {} keys\n", key_count);
 }
 
+void init_thread(size_t i) {
+  shard_id = i;
+  kvs_ = kv_shards_[i];
+  zsets_ = zset_shards_[i];
+  kv_db_ = kv_db_shards_[i];
+  zset_db_ = zset_db_shards_[i];
+  {
+    auto count = 0;
+    auto it = std::unique_ptr<rocksdb::Iterator>(
+        kv_db_->NewIterator(get_bulk_read_options()));
+    for (it->SeekToFirst(); it->Valid(); it->Next()) {
+      auto key = it->key();
+      auto value = it->value();
+      kvs_->insert({key.ToString(), value.ToString()});
+      count++;
+    }
+    fmt::print("shard {} kv count: {}\n", shard_id, count);
+  }
+  {
+    auto it = std::unique_ptr<rocksdb::Iterator>(
+        zset_db_->NewIterator(get_bulk_read_options()));
+    auto count = 0;
+    for (it->SeekToFirst(); it->Valid(); it->Next()) {
+      auto full_key = it->key();
+      auto score_raw = it->value();
+      auto score = *reinterpret_cast<uint32_t const *>(score_raw.data());
+      auto [key, value] = decode_zset_key(full_key);
+      xcore_zadd_local_no_persist(key, value, score);
+      count++;
+    }
+    fmt::print("shard {} zset count: {}\n", shard_id, count);
+  }
+}
+
 int main(int argc, char *argv[]) {
   shard_id = 0;
   cores = get_cpu_affinity();
@@ -2036,64 +2066,32 @@ int main(int argc, char *argv[]) {
     zset_db_shards_[i] = zset_db;
   }
   main_loop =
-      loop_with_queue::create(cores.size(), 16384, IORING_SETUP_SQPOLL, -1, 0);
+      loop_with_queue::create(cores.size(), 16384);
   main_loop->waker();
   ::signal(SIGPIPE, SIG_IGN);
   bind_cpu(cores[0]);
   for (int i = 0; i < cores.size(); ++i) {
     auto thread = std::thread([i, core = cores[i]] {
-      shard_id = i;
-      kvs_ = kv_shards_[i];
-      zsets_ = zset_shards_[i];
-      kv_db_ = kv_db_shards_[i];
-      zset_db_ = zset_db_shards_[i];
       fmt::print("thread {} bind to core {}\n", i, core);
       bind_cpu(core);
-      {
-        auto count = 0;
-        auto it = std::unique_ptr<rocksdb::Iterator>(
-            kv_db_->NewIterator(get_bulk_read_options()));
-        for (it->SeekToFirst(); it->Valid(); it->Next()) {
-          auto key = it->key();
-          auto value = it->value();
-          kvs_->insert({key.ToString(), value.ToString()});
-          count++;
-        }
-        fmt::print("shard {} kv count: {}\n", shard_id, count);
+
+      if (i != 0) {
+        auto loop = loop_with_queue::create(
+            cores.size(), 8192, IORING_SETUP_ATTACH_WQ, main_loop->fd());
+        loops[i] = loop;
+        init_thread(i);
+      } else {
+        loops[i] = main_loop;
       }
-      {
-        auto it = std::unique_ptr<rocksdb::Iterator>(
-            zset_db_->NewIterator(get_bulk_read_options()));
-        auto count = 0;
-        for (it->SeekToFirst(); it->Valid(); it->Next()) {
-          auto full_key = it->key();
-          auto score_raw = it->value();
-          auto score = *reinterpret_cast<uint32_t const *>(score_raw.data());
-          auto [key, value] = decode_zset_key(full_key);
-          xcore_zadd_local_no_persist(key, value, score);
-          count++;
-        }
-        fmt::print("shard {} zset count: {}\n", shard_id, count);
-      }
-      auto persist_thread = std::thread([i]() {
-        for (;;) {
-          uint64_t count;
-          ::read(persist_efds_[i], &count, sizeof(count));
-          while (!persist_queue_[i]->empty()) {
-            persist_queue_[i]->consume_one([](auto h) { h.resume(); });
-          }
-          persist_queue_[i]->sleep();
-        }
-      });
-      persist_thread.detach();
-      auto loop = loop_with_queue::create(
-          cores.size(), 8192, IORING_SETUP_ATTACH_WQ, main_loop->fd());
-      loops[i] = loop;
       loop_started.fetch_add(1);
-      loop->waker();
       db_flusher().detach();
-      for (;;) {
-        loop->poll();
+      if (i != 0) {
+        for (;;) {
+          loops[i]->poll_no_wait();
+          for (size_t c = 0; c < cores.size(); ++c) {
+            loops[i]->run_pending(c);
+          }
+        }
       }
     });
     thread.detach();
@@ -2103,8 +2101,12 @@ int main(int argc, char *argv[]) {
   }
   rpc_server(main_loop, "58080").detach();
   http_server(main_loop).detach();
+  init_thread(0);
   for (;;) {
-    main_loop->poll();
+    main_loop->poll_no_wait();
+    for (size_t c = 0; c < cores.size(); ++c) {
+      main_loop->run_pending(c);
+    }
   }
   return 0;
 }
