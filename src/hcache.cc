@@ -1569,12 +1569,14 @@ int main(int argc, char *argv[]) {
   cds::gc::HP hpGC;
   store = std::make_unique<storage>();
   {
-    auto kv_thread = std::jthread([]() {
+    auto kv_thread = std::thread([]() {
       store->load_kv();
     });
-    auto zset_thread = std::jthread([]() {
+    auto zset_thread = std::thread([]() {
       store->load_zset();
     });
+    kv_thread.join();
+    zset_thread.join();
   }
   auto flush_thread = std::thread([]() {
     for (;;) {

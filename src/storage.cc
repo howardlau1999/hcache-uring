@@ -76,7 +76,7 @@ void storage::first_time_init() {
       std::chrono::steady_clock::now();
   std::atomic<size_t> key_count;
   {
-    std::vector<std::jthread> threads;
+    std::vector<std::thread> threads;
     for (auto dir : init_dirs) {
       rocksdb::DB *load_db;
       auto status =
@@ -123,6 +123,9 @@ void storage::first_time_init() {
         }
         key_count += count;
       });
+    }
+    for (auto &t : threads) {
+      t.join();
     }
   }
   rocksdb::IngestExternalFileOptions ingest_options;
