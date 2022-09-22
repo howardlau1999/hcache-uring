@@ -6,6 +6,10 @@ include(ExternalProject)
 include(ProcessorCount)
 ProcessorCount(N)
 
+if (CMAKE_CXX_COMPILER_ID MATCHES Clang)
+  set(ROCKSDB_USE_CLANG USE_CLANG=1 CC=clang CXX=clang++ "EXTRA_CXXFLAGS=-stdlib=libc++ -Wno-unused-but-set-variable")
+endif ()
+
 ExternalProject_Add(rocksdb_src
     PREFIX ${CMAKE_CURRENT_BINARY_DIR}/rocksdb
     URL ${CMAKE_CURRENT_LIST_DIR}/third_party/rocksdb
@@ -37,6 +41,11 @@ if(COMPILER_SUPPORTS_FLTO)
         set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -flto")
     endif()
 endif()
+
+if (CMAKE_CXX_COMPILER_ID MATCHES Clang)
+  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wunused-but-set-variable")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fcoroutines-ts -stdlib=libc++ -Wunused-but-set-variable")
+endif ()
 
 find_package(ZLIB)
 find_package(Boost)
