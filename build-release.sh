@@ -19,7 +19,7 @@ if ! [ -d ../liburing ]; then
   CC=clang CXX=clang++ ./configure
   make -j$(nproc)
   make install
-  cd hacahe-uring
+  cd hcache-uring
 fi 
 
 CXX=clang++ CC=clang cmake -Bbuild -DCMAKE_BUILD_TYPE=Release -GNinja .
