@@ -50,8 +50,10 @@ set(BUILD_EXAMPLES OFF)
 set(BUILD_TESTING OFF)
 include_directories(third_party/rapidjson/include)
 include_directories(third_party/uringpp/include)
+include_directories(include)
 
 add_library(hcache-common src/storage.cc src/threading.cc src/picohttpparser.c)
+add_dependencies(hcache-common rocksdb_src)
 target_link_libraries(hcache-common 
   PUBLIC        
     rocksdb
