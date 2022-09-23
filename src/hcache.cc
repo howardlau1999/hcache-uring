@@ -1258,7 +1258,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
             rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
             d.Accept(writer);
           };
-          constexpr size_t batch_size = 64;
+          constexpr size_t batch_size = 128;
           bool sending = false;
           std::coroutine_handle<> finish_callback = nullptr;
           std::list<rapidjson::StringBuffer> buffers;
@@ -1401,7 +1401,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
               rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
               d.Accept(writer);
             };
-            constexpr size_t batch_size = 64;
+            constexpr size_t batch_size = 128;
             std::list<rapidjson::StringBuffer> buffers;
             auto send_batch_chunk = [&]() -> task<void> {
               size_t chunk_size = 0;
