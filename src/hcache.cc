@@ -412,7 +412,7 @@ task<void> handle_rpc(uringpp::socket conn, size_t conn_id) {
             p += sizeof(uint32_t);
             std::copy_n(v.value.data(), v.value.size(), p);
             p += v.value.size();
-            if (p - last_write_cursor > 256 * 1024) {
+            if (p - last_write_cursor > 32 * 1024) {
               co_await send_all(conn, last_write_cursor, p - last_write_cursor);
               last_write_cursor = p;
             }
@@ -540,7 +540,7 @@ task<void> handle_rpc(uringpp::socket conn, size_t conn_id) {
           p += sv.value.size();
           *reinterpret_cast<uint32_t *>(p) = sv.score;
           p += sizeof(uint32_t);
-          if (p - last_write_cursor > 256 * 1024) {
+          if (p - last_write_cursor > 32 * 1024) {
             co_await send_all(conn, last_write_cursor, p - last_write_cursor);
             last_write_cursor = p;
           }
@@ -1260,7 +1260,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
             rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
             d.Accept(writer);
           };
-          constexpr size_t batch_size = 1000;
+          constexpr size_t batch_size = 50;
           bool first = true;
           size_t batch_idx = 0;
           size_t chunk_size = 0;
@@ -1377,7 +1377,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
               rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
               d.Accept(writer);
             };
-            constexpr size_t batch_size = 1000;
+            constexpr size_t batch_size = 50;
             bool first = true;
             char left_bracket = '[';
             char comma = ',';
