@@ -2,6 +2,7 @@
 #include "io_buffer.h"
 #include "rapidjson/stringbuffer.h"
 #include "rpc.h"
+#include "simdjson/common_defs.h"
 #include "storage.h"
 #include "threading.h"
 #include <algorithm>
@@ -35,6 +36,7 @@
 #include <uringpp/listener.h>
 #include <uringpp/socket.h>
 #include <uringpp/task.h>
+#include <zstd.h>
 
 using uringpp::task;
 
@@ -258,7 +260,8 @@ uringpp::task<void> send_chunks(uringpp::socket &conn,
   co_await writev_all(conn, iov.data(), iov.size());
 }
 
-constexpr size_t kRPCReplyHeaderSize = sizeof(uint64_t) + sizeof(uint32_t);
+constexpr size_t kRPCReplyHeaderSize =
+    sizeof(uint64_t) + sizeof(uint32_t) + sizeof(uint32_t);
 uringpp::task<void> rpc_reply(uringpp::socket &conn, uint64_t req_id,
                               std::vector<char> data) {
   char header[kRPCReplyHeaderSize];
@@ -268,16 +271,24 @@ uringpp::task<void> rpc_reply(uringpp::socket &conn, uint64_t req_id,
   p += sizeof(uint64_t);
   *(uint32_t *)p = len;
   p += sizeof(uint32_t);
+  std::vector<char> compressed(ZSTD_compressBound(data.size()));
+  auto compressed_size = [&]() {
+    return len > 0 ? ZSTD_compress(compressed.data(), compressed.size(),
+                                   data.data(), data.size(), 1)
+                   : 0;
+  }();
+  data.clear();
+  *(uint32_t *)p = compressed_size;
   struct iovec iov[2];
   iov[0].iov_base = header;
   iov[0].iov_len = kRPCReplyHeaderSize;
-  iov[1].iov_base = const_cast<char *>(data.data());
-  iov[1].iov_len = len;
+  iov[1].iov_base = const_cast<char *>(compressed.data());
+  iov[1].iov_len = compressed_size;
   co_await writev_all(conn, iov, 2);
 }
 
 constexpr size_t kRPCRequestHeaderSize =
-    sizeof(uint64_t) + sizeof(method) + sizeof(uint32_t);
+    sizeof(uint64_t) + sizeof(method) + sizeof(uint32_t) + sizeof(uint32_t);
 
 task<void> handle_rpc(uringpp::socket conn, size_t conn_id) {
   auto loop = rpc_loops[conn_id % rpc_loops.size()];
@@ -286,6 +297,7 @@ task<void> handle_rpc(uringpp::socket conn, size_t conn_id) {
   int state = kStateRecvHeader;
   uint64_t req_id = 0;
   uint32_t req_size = 0;
+  uint32_t compressed_size = 0;
   method m = method::query;
   while (true) {
     if (state == kStateRecvHeader) {
@@ -297,17 +309,19 @@ task<void> handle_rpc(uringpp::socket conn, size_t conn_id) {
         p += sizeof(m);
         req_size = *reinterpret_cast<uint32_t *>(p);
         p += sizeof(req_size);
-        request.advance_read(p - request.read_data());
+        compressed_size = *reinterpret_cast<uint32_t *>(p);
+        p += sizeof(compressed_size);
+        request.advance_read(kRPCRequestHeaderSize);
         state = kStateRecvBody;
-        if (req_size > request.writable()) {
-          request.expand(req_size - request.writable());
+        if (compressed_size > request.writable()) {
+          request.expand(compressed_size - request.writable());
         }
       } else if (request.writable() < kRPCRequestHeaderSize) {
         request.expand(kRPCRequestHeaderSize - request.writable());
       }
     }
     if (state == kStateRecvBody) {
-      if (request.readable() >= req_size) {
+      if (request.readable() >= compressed_size) {
         state = kStateProcess;
       }
     }
@@ -320,8 +334,11 @@ task<void> handle_rpc(uringpp::socket conn, size_t conn_id) {
       request.advance_write(n);
       continue;
     }
-
-    auto req_p = request.read_data();
+    std::vector<char> decompressed(req_size);
+    auto decompressed_size = ZSTD_decompress(
+        decompressed.data(), req_size, request.read_data(), compressed_size);
+    assert(decompressed_size == req_size);
+    auto req_p = decompressed.data();
     switch (m) {
     case method::query: {
       uint32_t key_size = *reinterpret_cast<uint32_t *>(req_p);
@@ -470,9 +487,10 @@ task<void> handle_rpc(uringpp::socket conn, size_t conn_id) {
       }
     } break;
     }
-    request.advance_read(req_size);
+    request.advance_read(compressed_size);
     state = kStateRecvHeader;
     req_size = 0;
+    compressed_size = 0;
   }
 }
 
@@ -482,23 +500,43 @@ struct pending_call {
 };
 
 task<std::vector<char>> send_rpc_request(conn_pool &pool,
-                                         std::vector<char> body, size_t len,
-                                         pending_call *pending) {
-  struct iovec iov[1];
-  iov[0].iov_base = (void *)&body[0];
-  iov[0].iov_len = len;
+                                         std::vector<char> body,
+                                         pending_call *pending, method m) {
+  uint32_t req_size = body.size();
+  std::vector<char> compressed(ZSTD_compressBound(body.size()));
+  size_t compressed_len = ZSTD_compress(&compressed[0], compressed.size(),
+                                        &body[0], body.size(), 1);
+  if (ZSTD_isError(compressed_len)) {
+    fmt::print(stderr, "ZSTD_compress failed: {}\n",
+               ZSTD_getErrorName(compressed_len));
+  }
+  body.clear();
+  char header[kRPCRequestHeaderSize];
+  auto p = &header[0];
+  *reinterpret_cast<uint64_t *>(p) = reinterpret_cast<uint64_t>(pending);
+  p += sizeof(uint64_t);
+  *reinterpret_cast<method *>(p) = m;
+  p += sizeof(method);
+  *reinterpret_cast<uint32_t *>(p) = req_size;
+  p += sizeof(uint32_t);
+  *reinterpret_cast<uint32_t *>(p) = compressed_len;
+  p += sizeof(uint32_t);
+  struct iovec iov[2];
+  iov[0].iov_base = header;
+  iov[0].iov_len = kRPCRequestHeaderSize;
+  iov[1].iov_base = (void *)&compressed[0];
+  iov[1].iov_len = compressed_len;
   auto conn = co_await pool.get_conn();
-  co_await writev_all(*conn->conn, iov, 1);
+  co_await writev_all(*conn->conn, iov, 2);
   pool.put_conn(conn);
   co_await std::suspend_always{};
   co_return std::move(pending->response);
 }
 
-task<std::vector<char>> rpc_call(conn_pool &pool, std::vector<char> body,
-                                 size_t len) {
+task<std::vector<char>> rpc_call(conn_pool &pool, method m,
+                                 std::vector<char> body) {
   auto pending = new pending_call;
-  *reinterpret_cast<uint64_t *>(&body[0]) = reinterpret_cast<uint64_t>(pending);
-  auto t = send_rpc_request(pool, std::move(body), len, pending);
+  auto t = send_rpc_request(pool, std::move(body), pending, m);
   pending->h = t.h_;
   return t;
 }
@@ -506,17 +544,10 @@ task<std::vector<char>> rpc_call(conn_pool &pool, std::vector<char> body,
 task<std::optional<std::pair<std::vector<char>, std::string_view>>>
 remote_query(conn_pool &pool, std::string_view key) {
   auto body_size = key.size() + sizeof(uint32_t);
-  auto header_body = std::vector<char>(kRPCRequestHeaderSize + body_size);
-  *reinterpret_cast<method *>(&header_body[sizeof(uint64_t)]) = method::query;
-  *reinterpret_cast<uint32_t *>(
-      &header_body[sizeof(uint64_t) + sizeof(method)]) = body_size;
-  *reinterpret_cast<uint32_t *>(
-      &header_body[sizeof(uint64_t) + sizeof(method) + sizeof(uint32_t)]) =
-      key.size();
-  std::copy_n(key.data(), key.size(),
-              header_body.begin() + kRPCRequestHeaderSize + sizeof(uint32_t));
-  auto response = co_await rpc_call(pool, std::move(header_body),
-                                    kRPCRequestHeaderSize + body_size);
+  auto body = std::vector<char>(body_size);
+  *reinterpret_cast<uint32_t *>(&body[0]) = key.size();
+  std::copy_n(key.data(), key.size(), body.begin() + sizeof(uint32_t));
+  auto response = co_await rpc_call(pool, method::query, std::move(body));
   if (response.empty()) {
     co_return std::nullopt;
   }
@@ -530,11 +561,8 @@ remote_query(conn_pool &pool, std::string_view key) {
 task<void> remote_add(conn_pool &pool, std::string_view key,
                       std::string_view value) {
   auto body_size = key.size() + value.size() + sizeof(uint32_t) * 2;
-  auto header_body = std::vector<char>(kRPCRequestHeaderSize + body_size);
-  *reinterpret_cast<method *>(&header_body[sizeof(uint64_t)]) = method::add;
-  *reinterpret_cast<uint32_t *>(&header_body[0] + sizeof(uint64_t) +
-                                sizeof(method)) = body_size;
-  auto body_p = &header_body[0] + kRPCRequestHeaderSize;
+  auto body = std::vector<char>(body_size);
+  auto body_p = &body[0];
   *reinterpret_cast<uint32_t *>(body_p) = key.size();
   body_p += sizeof(uint32_t);
   std::copy_n(key.data(), key.size(), body_p);
@@ -542,22 +570,17 @@ task<void> remote_add(conn_pool &pool, std::string_view key,
   *reinterpret_cast<uint32_t *>(body_p) = value.size();
   body_p += sizeof(uint32_t);
   std::copy_n(value.data(), value.size(), body_p);
-  co_await rpc_call(pool, std::move(header_body),
-                    kRPCRequestHeaderSize + body_size);
+  co_await rpc_call(pool, method::add, std::move(body));
 }
 
 task<void> remote_del(conn_pool &pool, std::string_view key) {
   auto body_size = key.size() + sizeof(uint32_t);
-  auto header_body = std::vector<char>(kRPCRequestHeaderSize + body_size);
-  *reinterpret_cast<method *>(&header_body[sizeof(uint64_t)]) = method::del;
-  *reinterpret_cast<uint32_t *>(&header_body[0] + sizeof(uint64_t) +
-                                sizeof(method)) = body_size;
-  auto body_p = &header_body[0] + kRPCRequestHeaderSize;
+  auto body = std::vector<char>(body_size);
+  auto body_p = &body[0];
   *reinterpret_cast<uint32_t *>(body_p) = key.size();
   body_p += sizeof(uint32_t);
   std::copy_n(key.data(), key.size(), body_p);
-  co_await rpc_call(pool, std::move(header_body),
-                    kRPCRequestHeaderSize + body_size);
+  co_await rpc_call(pool, method::del, std::move(body));
 }
 
 task<void> remote_batch(conn_pool &pool,
@@ -566,11 +589,8 @@ task<void> remote_batch(conn_pool &pool,
   for (auto const kv : kvs) {
     body_size += sizeof(uint32_t) * 2 + kv.key.size() + kv.value.size();
   }
-  auto header_body = std::vector<char>(kRPCRequestHeaderSize + body_size);
-  *reinterpret_cast<method *>(&header_body[sizeof(uint64_t)]) = method::batch;
-  *reinterpret_cast<uint32_t *>(&header_body[0] + sizeof(uint64_t) +
-                                sizeof(method)) = body_size;
-  auto body_p = &header_body[0] + kRPCRequestHeaderSize;
+  auto body = std::vector<char>(body_size);
+  auto body_p = &body[0];
   *reinterpret_cast<uint32_t *>(body_p) = kvs.size();
   body_p += sizeof(uint32_t);
   for (auto const kv : kvs) {
@@ -583,8 +603,7 @@ task<void> remote_batch(conn_pool &pool,
     std::copy_n(kv.value.data(), kv.value.size(), body_p);
     body_p += kv.value.size();
   }
-  co_await rpc_call(pool, std::move(header_body),
-                    kRPCRequestHeaderSize + body_size);
+  co_await rpc_call(pool, method::batch, std::move(body));
 }
 
 task<std::pair<std::vector<char>, std::vector<key_value_view>>>
@@ -593,11 +612,8 @@ remote_list(conn_pool &pool, std::unordered_set<std::string_view> const &keys) {
   for (auto const &key : keys) {
     body_size += sizeof(uint32_t) + key.size();
   }
-  auto header_body = std::vector<char>(kRPCRequestHeaderSize + body_size);
-  *reinterpret_cast<method *>(&header_body[sizeof(uint64_t)]) = method::list;
-  *reinterpret_cast<uint32_t *>(&header_body[0] + sizeof(uint64_t) +
-                                sizeof(method)) = body_size;
-  auto body_p = &header_body[0] + kRPCRequestHeaderSize;
+  auto body = std::vector<char>(body_size);
+  auto body_p = &body[0];
   *reinterpret_cast<uint32_t *>(body_p) = keys.size();
   body_p += sizeof(uint32_t);
   for (auto const &key : keys) {
@@ -606,8 +622,7 @@ remote_list(conn_pool &pool, std::unordered_set<std::string_view> const &keys) {
     std::copy_n(key.data(), key.size(), body_p);
     body_p += key.size();
   }
-  auto response = co_await rpc_call(pool, std::move(header_body),
-                                    kRPCRequestHeaderSize + body_size);
+  auto response = co_await rpc_call(pool, method::list, std::move(body));
   auto rep_p = response.data();
   auto rep_count = *reinterpret_cast<uint32_t *>(rep_p);
   rep_p += sizeof(uint32_t);
@@ -629,11 +644,8 @@ remote_list(conn_pool &pool, std::unordered_set<std::string_view> const &keys) {
 task<void> remote_zadd(conn_pool &pool, std::string_view key,
                        std::string_view value, uint32_t score) {
   auto body_size = key.size() + value.size() + sizeof(uint32_t) * 3;
-  auto header_body = std::vector<char>(kRPCRequestHeaderSize + body_size);
-  *reinterpret_cast<method *>(&header_body[sizeof(uint64_t)]) = method::zadd;
-  *reinterpret_cast<uint32_t *>(&header_body[0] + sizeof(uint64_t) +
-                                sizeof(method)) = body_size;
-  auto body_p = &header_body[0] + kRPCRequestHeaderSize;
+  auto body = std::vector<char>(body_size);
+  auto body_p = &body[0];
   *reinterpret_cast<uint32_t *>(body_p) = key.size();
   body_p += sizeof(uint32_t);
   std::copy_n(key.data(), key.size(), body_p);
@@ -643,19 +655,15 @@ task<void> remote_zadd(conn_pool &pool, std::string_view key,
   std::copy_n(value.data(), value.size(), body_p);
   body_p += value.size();
   *reinterpret_cast<uint32_t *>(body_p) = score;
-  co_await rpc_call(pool, std::move(header_body),
-                    kRPCRequestHeaderSize + body_size);
+  co_await rpc_call(pool, method::zadd, std::move(body));
 }
 
 task<std::optional<std::pair<std::vector<char>, std::vector<score_value_view>>>>
 remote_zrange(conn_pool &pool, std::string_view key, uint32_t min_score,
               uint32_t max_score) {
   auto body_size = sizeof(uint32_t) * 3 + key.size();
-  auto header_body = std::vector<char>(kRPCRequestHeaderSize + body_size);
-  *reinterpret_cast<method *>(&header_body[sizeof(uint64_t)]) = method::zrange;
-  *reinterpret_cast<uint32_t *>(&header_body[0] + sizeof(uint64_t) +
-                                sizeof(method)) = body_size;
-  auto body_p = &header_body[0] + kRPCRequestHeaderSize;
+  auto body = std::vector<char>(body_size);
+  auto body_p = &body[0];
   *reinterpret_cast<uint32_t *>(body_p) = key.size();
   body_p += sizeof(uint32_t);
   std::copy_n(key.data(), key.size(), body_p);
@@ -663,8 +671,7 @@ remote_zrange(conn_pool &pool, std::string_view key, uint32_t min_score,
   *reinterpret_cast<uint32_t *>(body_p) = min_score;
   body_p += sizeof(uint32_t);
   *reinterpret_cast<uint32_t *>(body_p) = max_score;
-  auto response = co_await rpc_call(pool, std::move(header_body),
-                                    kRPCRequestHeaderSize + body_size);
+  auto response = co_await rpc_call(pool, method::zrange, std::move(body));
   if (response.empty()) {
     co_return std::nullopt;
   }
@@ -687,11 +694,8 @@ remote_zrange(conn_pool &pool, std::string_view key, uint32_t min_score,
 task<void> remote_zrmv(conn_pool &pool, std::string_view key,
                        std::string_view value) {
   auto body_size = key.size() + value.size() + sizeof(uint32_t) * 2;
-  auto header_body = std::vector<char>(kRPCRequestHeaderSize + body_size);
-  *reinterpret_cast<method *>(&header_body[sizeof(uint64_t)]) = method::zrmv;
-  *reinterpret_cast<uint32_t *>(&header_body[0] + sizeof(uint64_t) +
-                                sizeof(method)) = body_size;
-  auto body_p = &header_body[0] + kRPCRequestHeaderSize;
+  auto body = std::vector<char>(body_size);
+  auto body_p = &body[0];
   *reinterpret_cast<uint32_t *>(body_p) = key.size();
   body_p += sizeof(uint32_t);
   std::copy_n(key.data(), key.size(), body_p);
@@ -699,15 +703,15 @@ task<void> remote_zrmv(conn_pool &pool, std::string_view key,
   *reinterpret_cast<uint32_t *>(body_p) = value.size();
   body_p += sizeof(uint32_t);
   std::copy_n(value.data(), value.size(), body_p);
-  co_await rpc_call(pool, std::move(header_body),
-                    kRPCRequestHeaderSize + body_size);
+  co_await rpc_call(pool, method::zrmv, std::move(body));
 }
 
 task<void> rpc_reply_recv_loop(uringpp::socket &rpc_conn) {
   io_buffer response(65536);
   int state = kStateRecvHeader;
-  size_t rep_size = 0;
+  uint32_t rep_size = 0;
   uint64_t req_id = 0;
+  uint32_t compressed_size = 0;
   while (true) {
     if (state == kStateRecvHeader) {
       if (response.readable() >= kRPCReplyHeaderSize) {
@@ -716,17 +720,19 @@ task<void> rpc_reply_recv_loop(uringpp::socket &rpc_conn) {
         p += sizeof(req_id);
         rep_size = *reinterpret_cast<uint32_t *>(p);
         p += sizeof(rep_size);
+        compressed_size = *reinterpret_cast<uint32_t *>(p);
+        p += sizeof(compressed_size);
         state = kStateRecvBody;
         response.advance_read(kRPCReplyHeaderSize);
-        if (response.writable() < rep_size) {
-          response.expand(rep_size - response.writable());
+        if (response.writable() < compressed_size) {
+          response.expand(compressed_size - response.writable());
         }
       } else if (response.writable() < kRPCReplyHeaderSize) {
         response.expand(kRPCReplyHeaderSize - response.writable());
       }
     }
     if (state == kStateRecvBody) {
-      if (response.readable() >= rep_size) {
+      if (response.readable() >= compressed_size) {
         state = kStateProcess;
       }
     }
@@ -745,13 +751,20 @@ task<void> rpc_reply_recv_loop(uringpp::socket &rpc_conn) {
       continue;
     }
     auto pending = reinterpret_cast<pending_call *>(req_id);
-    pending->response.assign(response.read_data(),
-                             response.read_data() + rep_size);
-    response.advance_read(rep_size);
+    pending->response.resize(rep_size);
+    if (rep_size > 0) {
+      assert(compressed_size > 0);
+      auto decompressed_size =
+          ZSTD_decompress(&pending->response[0], rep_size, response.read_data(),
+                          compressed_size);
+      assert(decompressed_size == rep_size);
+      response.advance_read(compressed_size);
+    }
     pending->h.resume();
     delete pending;
     state = kStateRecvHeader;
     rep_size = 0;
+    compressed_size = 0;
   }
 }
 
@@ -787,6 +800,65 @@ task<void> send_all(uringpp::socket &conn, const char *data, size_t size) {
     }
     data += n;
     size -= n;
+  }
+}
+
+template <class It>
+task<void> send_score_values(uringpp::socket &conn, size_t count, It begin,
+                             It end) {
+  if (count < 64) {
+    // zrange
+    rapidjson::StringBuffer buffer;
+    auto d = rapidjson::Document();
+    auto &sv_list = d.SetArray();
+    auto &allocator = d.GetAllocator();
+    auto write_sv = [&](std::string_view value, uint32_t score) {
+      auto sv_object = rapidjson::Value(rapidjson::kObjectType);
+      auto v_string = rapidjson::StringRef(value.data(), value.size());
+      sv_object.AddMember("value", v_string, allocator);
+      sv_object.AddMember("score", score, allocator);
+      sv_list.PushBack(sv_object, allocator);
+    };
+    for (auto it = begin; it != end; ++it) {
+      write_sv(it->value, it->score);
+    }
+    rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
+    d.Accept(writer);
+    co_await send_json(conn, std::move(buffer));
+  } else {
+    co_await send_all(conn, CHUNK_RESPONSE, sizeof(CHUNK_RESPONSE) - 1);
+    auto d = rapidjson::Document();
+    auto &allocator = d.GetAllocator();
+    constexpr size_t batch_size = 512;
+    rapidjson::StringBuffer buffers[batch_size];
+    size_t batch_idx = 0;
+    bool is_first = true;
+    auto write_sv = [&](std::string_view value, uint32_t score) -> task<void> {
+      auto &sv_object = d.SetObject();
+      auto v_string = rapidjson::StringRef(value.data(), value.size());
+      sv_object.AddMember("value", v_string, allocator);
+      sv_object.AddMember("score", score, allocator);
+      auto &buffer = buffers[batch_idx];
+      buffer.Clear();
+      if (is_first) {
+        is_first = false;
+      } else {
+        buffer.Put(',');
+      }
+      rapidjson::Writer writer(buffer);
+      d.Accept(writer);
+      if (++batch_idx == batch_size) {
+        co_await send_chunks(conn, buffers, batch_idx);
+        batch_idx = 0;
+      }
+    };
+    for (auto it = begin; it != end; ++it) {
+      co_await write_sv(it->value, it->score);
+    }
+    if (batch_idx > 0) {
+      co_await send_chunks(conn, buffers, batch_idx);
+    }
+    co_await send_all(conn, CHUNK_END, sizeof(CHUNK_END) - 1);
   }
 }
 
@@ -838,13 +910,19 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
                 break;
               }
             }
-            if (content_length > request.writable()) {
-              request.expand(content_length - request.writable());
+            if (content_length + simdjson::SIMDJSON_PADDING >
+                request.writable()) {
+              request.expand(content_length + simdjson::SIMDJSON_PADDING -
+                             request.writable());
             }
           }
         } else if (request.writable() == 0) {
           request.expand(2048);
         }
+      }
+
+      if (request.writable() < simdjson::SIMDJSON_PADDING) {
+        request.expand(simdjson::SIMDJSON_PADDING);
       }
 
       if (parser_rc > 0) {
@@ -977,8 +1055,9 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
         } break;
         case 'a': {
           // add
-          simdjson::padded_string json =
-              simdjson::padded_string(body_start, content_length);
+          auto json = simdjson::padded_string_view(body_start, content_length,
+                                                   request.capacity() -
+                                                       request.read_idx());
           auto doc = parser.parse(json);
           auto const key = doc["key"].get_string().take_value();
           auto const value = doc["value"].get_string().take_value();
@@ -992,8 +1071,9 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
         } break;
         case 'b': {
           // batch
-          simdjson::padded_string json =
-              simdjson::padded_string(body_start, content_length);
+          auto json = simdjson::padded_string_view(body_start, content_length,
+                                                   request.capacity() -
+                                                       request.read_idx());
           auto doc = parser.parse(json);
           auto arr = doc.get_array().take_value();
           std::vector<std::vector<key_value_view>> sharded_keys(nr_peers);
@@ -1022,8 +1102,9 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
         } break;
         case 'l': {
           // list
-          simdjson::padded_string json =
-              simdjson::padded_string(body_start, content_length);
+          auto json = simdjson::padded_string_view(body_start, content_length,
+                                                   request.capacity() -
+                                                       request.read_idx());
           auto doc = parser.parse(json);
           auto arr = doc.get_array().take_value();
           std::unordered_set<std::string_view> keys;
@@ -1061,10 +1142,40 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
           if (local_key_values.empty() && remote_kv_count == 0) {
             co_await send_all(conn, HTTP_404, sizeof(HTTP_404) - 1);
           } else {
-            {
+            if (local_key_values.size() + remote_kv_count < 64) {
+              rapidjson::StringBuffer buffer;
+              {
+                auto d = rapidjson::Document();
+                auto &kv_list = d.SetArray();
+                auto &allocator = d.GetAllocator();
+                kv_list.Reserve(remote_kv_count + local_key_values.size(),
+                                allocator);
+                auto write_kv = [&](std::string_view key,
+                                    std::string_view value) {
+                  auto kv_object = rapidjson::Value(rapidjson::kObjectType);
+                  auto k_string = rapidjson::StringRef(key.data(), key.size());
+                  auto v_string =
+                      rapidjson::StringRef(value.data(), value.size());
+                  kv_object.AddMember("key", k_string, allocator);
+                  kv_object.AddMember("value", v_string, allocator);
+                  kv_list.PushBack(kv_object, allocator);
+                };
+                for (auto &kv : local_key_values) {
+                  write_kv(kv.key, kv.value);
+                }
+                for (auto const &remote_kvs : remote_key_values) {
+                  for (auto const kv : remote_kvs) {
+                    write_kv(kv.key, kv.value);
+                  }
+                }
+                rapidjson::Writer writer(buffer);
+                d.Accept(writer);
+              }
+              co_await send_json(conn, std::move(buffer));
+            } else {
               co_await send_all(conn, CHUNK_RESPONSE,
                                 sizeof(CHUNK_RESPONSE) - 1);
-              constexpr size_t batch_size = 512;
+              constexpr size_t batch_size = 128;
               size_t batch_idx = 0;
               bool is_first = true;
               rapidjson::StringBuffer buffers[batch_size];
@@ -1111,8 +1222,9 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
           case 'a': {
             // zadd
             std::string_view key(&path[6], path_len - 6);
-            simdjson::padded_string json =
-                simdjson::padded_string(body_start, content_length);
+            auto json = simdjson::padded_string_view(body_start, content_length,
+                                                     request.capacity() -
+                                                         request.read_idx());
             auto score_value = parser.parse(json);
             auto value = score_value["value"].get_string().take_value();
             auto score = score_value["score"].get_uint64().take_value();
@@ -1128,52 +1240,22 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
           case 'r': {
             // zrange
             std::string_view key(&path[8], path_len - 8);
-            simdjson::padded_string json =
-                simdjson::padded_string(body_start, content_length);
+            auto json = simdjson::padded_string_view(body_start, content_length,
+                                                     request.capacity() -
+                                                         request.read_idx());
             auto score_range = parser.parse(json);
             auto min_score = score_range["min_score"].get_uint64().take_value();
             auto max_score = score_range["max_score"].get_uint64().take_value();
             auto key_shard = get_shard(key);
-            auto d = rapidjson::Document();
-            auto &allocator = d.GetAllocator();
-            constexpr size_t batch_size = 512;
-            rapidjson::StringBuffer buffers[batch_size];
-            size_t batch_idx = 0;
-            bool is_first = true;
-            auto write_sv = [&](std::string_view value,
-                                uint32_t score) -> task<void> {
-              auto &sv_object = d.SetObject();
-              auto v_string = rapidjson::StringRef(value.data(), value.size());
-              sv_object.AddMember("value", v_string, allocator);
-              sv_object.AddMember("score", score, allocator);
-              auto &buffer = buffers[batch_idx];
-              buffer.Clear();
-              if (is_first) {
-                is_first = false;
-              } else {
-                buffer.Put(',');
-              }
-              rapidjson::Writer writer(buffer);
-              d.Accept(writer);
-              if (++batch_idx == batch_size) {
-                co_await send_chunks(conn, buffers, batch_idx);
-                batch_idx = 0;
-              }
-            };
             if (key_shard == me) {
               auto score_values = store->zrange(key, min_score, max_score);
               if (!score_values.has_value()) {
                 co_await send_all(conn, HTTP_404, sizeof(HTTP_404) - 1);
               } else {
-                co_await send_all(conn, CHUNK_RESPONSE,
-                                  sizeof(CHUNK_RESPONSE) - 1);
-                for (auto const &sv : score_values.value()) {
-                  co_await write_sv(sv.value, sv.score);
-                }
-                if (batch_idx > 0) {
-                  co_await send_chunks(conn, buffers, batch_idx);
-                }
-                co_await send_all(conn, CHUNK_END, sizeof(CHUNK_RESPONSE) - 1);
+
+                co_await send_score_values(conn, score_values->size(),
+                                           score_values->begin(),
+                                           score_values->end());
               }
             } else {
               auto score_values =
@@ -1182,15 +1264,9 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
               if (!score_values.has_value()) {
                 co_await send_all(conn, HTTP_404, sizeof(HTTP_404) - 1);
               } else {
-                co_await send_all(conn, CHUNK_RESPONSE,
-                                  sizeof(CHUNK_RESPONSE) - 1);
-                for (auto const sv : score_values.value().second) {
-                  co_await write_sv(sv.value, sv.score);
-                }
-                if (batch_idx > 0) {
-                  co_await send_chunks(conn, buffers, batch_idx);
-                }
-                co_await send_all(conn, CHUNK_END, sizeof(CHUNK_RESPONSE) - 1);
+                co_await send_score_values(conn, score_values->second.size(),
+                                           score_values->second.begin(),
+                                           score_values->second.end());
               }
             }
           } break;
@@ -1303,7 +1379,7 @@ int main(int argc, char *argv[]) {
   auto flush_thread = std::thread([]() {
     for (;;) {
       store->flush();
-      std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+      std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
   });
   flush_thread.detach();
