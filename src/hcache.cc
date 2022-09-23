@@ -412,7 +412,7 @@ task<void> handle_rpc(uringpp::socket conn, size_t conn_id) {
             p += sizeof(uint32_t);
             std::copy_n(v.value.data(), v.value.size(), p);
             p += v.value.size();
-            if (p - last_write_cursor > 32 * 1024) {
+            if (p - last_write_cursor > 128 * 1024) {
               co_await send_all(conn, last_write_cursor, p - last_write_cursor);
               last_write_cursor = p;
             }
@@ -540,7 +540,7 @@ task<void> handle_rpc(uringpp::socket conn, size_t conn_id) {
           p += sv.value.size();
           *reinterpret_cast<uint32_t *>(p) = sv.score;
           p += sizeof(uint32_t);
-          if (p - last_write_cursor > 32 * 1024) {
+          if (p - last_write_cursor > 128 * 1024) {
             co_await send_all(conn, last_write_cursor, p - last_write_cursor);
             last_write_cursor = p;
           }
@@ -1002,8 +1002,6 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
     size_t path_len;
     size_t method_len;
     size_t num_headers = 16;
-    bool sending = false;
-    bool closed = false;
     std::list<output_page> send_buf;
     std::list<output_page> pending_send_buf;
     phr_header headers[16];
@@ -1260,45 +1258,62 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
             rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
             d.Accept(writer);
           };
-          constexpr size_t batch_size = 50;
-          bool first = true;
-          size_t batch_idx = 0;
-          size_t chunk_size = 0;
-          rapidjson::StringBuffer buffer[batch_size];
-          char chunk_length[32];
-          const char chunk_end[] = "\r\n";
-          struct iovec iov[batch_size + 2];
-          iov[0].iov_base = chunk_length;
+          constexpr size_t batch_size = 64;
+          bool sending = false;
+          std::coroutine_handle<> finish_callback = nullptr;
+          std::list<rapidjson::StringBuffer> buffers;
+          size_t sent = 0;
+          size_t kv_idx = 0;
           auto send_kv_chunk = [&]() -> task<void> {
-            for (size_t i = 0; i < batch_idx; ++i) {
-              iov[i + 1].iov_base = (void *)buffer[i].GetString();
-              iov[i + 1].iov_len = buffer[i].GetSize();
-              chunk_size += buffer[i].GetSize();
+            char chunk_length[32];
+            const char chunk_end[] = "\r\n";
+            while (buffers.size() > 0) {
+              auto send_count = buffers.size();
+              size_t chunk_size = 0;
+              auto start = buffers.begin();
+              auto it = buffers.begin();
+              std::vector<struct iovec> iov(send_count + 2);
+              iov[0].iov_base = chunk_length;
+              for (size_t i = 0; i < send_count; ++i) {
+                iov[i + 1].iov_base = (void *)it->GetString();
+                iov[i + 1].iov_len = it->GetSize();
+                chunk_size += it->GetSize();
+                ++it;
+              }
+              iov[send_count + 1].iov_base = (void *)chunk_end;
+              iov[send_count + 1].iov_len = 2;
+              assert(chunk_size > 0);
+              auto chunk_size_len = itohex(chunk_length, chunk_size);
+              chunk_length[chunk_size_len++] = '\r';
+              chunk_length[chunk_size_len++] = '\n';
+              iov[0].iov_len = chunk_size_len;
+              sending = true;
+              co_await writev_all(conn, iov.data(), iov.size());
+              sent += send_count;
+              sending = false;
+              for (size_t i = 0; i < send_count; ++i) {
+                buffers.pop_front();
+              }
             }
-            iov[batch_idx + 1].iov_base = (void *)chunk_end;
-            iov[batch_idx + 1].iov_len = 2;
-            auto chunk_size_len = itohex(chunk_length, chunk_size);
-            chunk_length[chunk_size_len++] = '\r';
-            chunk_length[chunk_size_len++] = '\n';
-            iov[0].iov_len = chunk_size_len;
-            co_await writev_all(conn, iov, batch_idx + 2);
-            for (size_t i = 0; i < batch_idx; ++i) {
-              buffer[i].Clear();
+            if (finish_callback) {
+              finish_callback.resume();
             }
-            batch_idx = 0;
-            chunk_size = 0;
           };
           auto kv_callback = [&](std::string_view key,
                                  std::string_view value) -> task<void> {
+            auto buffer = rapidjson::StringBuffer();
+            if (!is_first_kv_pair) {
+              buffer.Put(',');
+            }
+            write_kv(buffer, key, value);
+            buffers.emplace_back(std::move(buffer));
+            kv_idx++;
             if (is_first_kv_pair) {
               co_await send_all(conn, CHUNK_RESPONSE,
                                 sizeof(CHUNK_RESPONSE) - 1);
               is_first_kv_pair = false;
-            } else {
-              buffer[batch_idx].Put(',');
             }
-            write_kv(buffer[batch_idx], key, value);
-            if (++batch_idx == batch_size) {
+            if (buffers.size() >= batch_size && !sending) {
               co_await send_kv_chunk();
             }
           };
@@ -1330,8 +1345,17 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
           if (is_first_kv_pair) {
             co_await send_all(conn, HTTP_404, sizeof(HTTP_404) - 1);
           } else {
-            if (batch_idx > 0) {
+            if (buffers.size() > 0 && !sending) {
               co_await send_kv_chunk();
+            }
+            assert(buffers.size() == 0);
+            if (sent != kv_idx) {
+              auto wait_fn = []() -> task<void> {
+                co_await std::suspend_always{};
+              };
+              auto t = wait_fn();
+              finish_callback = t.h_;
+              co_await t;
             }
             co_await send_all(conn, CHUNK_END, sizeof(CHUNK_END) - 1);
           }
@@ -1377,35 +1401,32 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
               rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
               d.Accept(writer);
             };
-            constexpr size_t batch_size = 50;
-            bool first = true;
-            char left_bracket = '[';
-            char comma = ',';
-            size_t batch_idx = 0;
-            size_t chunk_size = 0;
-            rapidjson::StringBuffer buffer[batch_size];
-            char chunk_length[32];
-            const char chunk_end[] = "\r\n";
-            struct iovec iov[batch_size + 2];
-            iov[0].iov_base = chunk_length;
+            constexpr size_t batch_size = 64;
+            std::list<rapidjson::StringBuffer> buffers;
             auto send_batch_chunk = [&]() -> task<void> {
-              for (size_t i = 0; i < batch_idx; ++i) {
-                iov[i + 1].iov_base = (void *)buffer[i].GetString();
-                iov[i + 1].iov_len = buffer[i].GetSize();
-                chunk_size += buffer[i].GetSize();
+              size_t chunk_size = 0;
+              char chunk_length[32];
+              const char chunk_end[] = "\r\n";
+              auto send_count = buffers.size();
+              auto it = buffers.begin();
+              std::vector<struct iovec> iov(send_count + 2);
+              iov[0].iov_base = chunk_length;
+              for (size_t i = 0; i < send_count; ++i) {
+                iov[i + 1].iov_base = (void *)it->GetString();
+                iov[i + 1].iov_len = it->GetSize();
+                chunk_size += it->GetSize();
+                it++;
               }
-              iov[batch_idx + 1].iov_base = (void *)chunk_end;
-              iov[batch_idx + 1].iov_len = 2;
+              iov[send_count + 1].iov_base = (void *)chunk_end;
+              iov[send_count + 1].iov_len = 2;
               auto chunk_size_len = itohex(chunk_length, chunk_size);
               chunk_length[chunk_size_len++] = '\r';
               chunk_length[chunk_size_len++] = '\n';
               iov[0].iov_len = chunk_size_len;
-              co_await writev_all(conn, iov, batch_idx + 2);
-              for (size_t i = 0; i < batch_idx; ++i) {
-                buffer[i].Clear();
+              co_await writev_all(conn, iov.data(), iov.size());
+              for (size_t i = 0; i < send_count; ++i) {
+                buffers.pop_front();
               }
-              batch_idx = 0;
-              chunk_size = 0;
             };
             if (key_shard == me) {
               auto score_values = store->zrange(key, min_score, max_score);
@@ -1418,16 +1439,17 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
                                   sizeof(CHUNK_RESPONSE) - 1);
                 uint32_t sv_written = 0;
                 for (auto const sv : score_values.value()) {
-                  auto &buf = buffer[batch_idx];
-                  write_sv(buffer[batch_idx], sv.value, sv.score);
+                  auto buffer = rapidjson::StringBuffer();
+                  write_sv(buffer, sv.value, sv.score);
                   if (++sv_written != score_values->size()) {
-                    buf.Put(',');
+                    buffer.Put(',');
                   }
-                  if (++batch_idx == batch_size) {
+                  buffers.emplace_back(std::move(buffer));
+                  if (buffers.size() >= batch_size) {
                     co_await send_batch_chunk();
                   }
                 }
-                if (batch_idx > 0) {
+                if (buffers.size() > 0) {
                   co_await send_batch_chunk();
                 }
                 co_await send_all(conn, CHUNK_END, sizeof(CHUNK_END) - 1);
@@ -1444,16 +1466,17 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
                                         sizeof(CHUNK_RESPONSE) - 1);
                     }
                     if (current != total) {
-                      auto &buf = buffer[batch_idx];
-                      write_sv(buffer[batch_idx], value, score);
+                      auto buffer = rapidjson::StringBuffer();
+                      write_sv(buffer, value, score);
                       if (current + 1 != total) {
-                        buf.Put(',');
+                        buffer.Put(',');
                       }
-                      if (++batch_idx == batch_size) {
+                      buffers.emplace_back(std::move(buffer));
+                      if (buffers.size() > batch_size) {
                         co_await send_batch_chunk();
                       }
                     } else {
-                      if (batch_idx > 0) {
+                      if (buffers.size() > 0) {
                         co_await send_batch_chunk();
                       }
                       co_await send_all(conn, CHUNK_END, sizeof(CHUNK_END) - 1);
@@ -1568,12 +1591,8 @@ int main(int argc, char *argv[]) {
   cds::gc::HP hpGC;
   store = std::make_unique<storage>();
   {
-    auto kv_thread = std::thread([]() {
-      store->load_kv();
-    });
-    auto zset_thread = std::thread([]() {
-      store->load_zset();
-    });
+    auto kv_thread = std::thread([]() { store->load_kv(); });
+    auto zset_thread = std::thread([]() { store->load_zset(); });
     kv_thread.join();
     zset_thread.join();
   }
