@@ -229,6 +229,20 @@ void storage::add_no_persist(std::string_view key, std::string_view value) {
   }
 }
 
+rocksdb::WriteBatch *storage::start_batch() {
+  return new rocksdb::WriteBatch();
+}
+void storage::commit_batch(rocksdb::WriteBatch *batch) {
+  kv_db_->Write(write_options_, batch);
+  delete batch;
+}
+
+void storage::add_batch(rocksdb::WriteBatch *batch, std::string_view key,
+                        std::string_view value) {
+  add_no_persist(key, value);
+  batch->Put(key, value);
+}
+
 void storage::add(std::string_view key, std::string_view value) {
   add_no_persist(key, value);
   kv_db_->Put(write_options_, key, value);
@@ -326,7 +340,8 @@ void storage::zrmv(std::string_view key, std::string_view value) {
                    rocksdb::Slice(full_key.data(), full_key.size()));
   // zsets_.find(key, [key, value](zset_intl &zset, ...) {
   //   std::lock_guard lock(zset.mutex);
-  //   if (auto it = zset.value_score.find(value); it != zset.value_score.end()) {
+  //   if (auto it = zset.value_score.find(value); it != zset.value_score.end())
+  //   {
   //     auto score = it->second;
   //     zset.value_score.erase(it);
   //     auto &values = zset.score_values[score];
@@ -375,8 +390,8 @@ storage::zrange(std::string_view key, uint32_t min_score, uint32_t max_score) {
     auto zset_it = zsets_[shard].find(key);
     if (zset_it != zsets_[shard].end()) {
       for (auto it = zset_it->second->score_values.lower_bound(min_score);
-           it != zset_it->second->score_values.end() && it->first <=
-           max_score; it++) {
+           it != zset_it->second->score_values.end() && it->first <= max_score;
+           it++) {
         for (auto &&value : it->second) {
           ret.emplace_back(score_value{value.key, it->first});
         }

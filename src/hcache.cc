@@ -1,4 +1,3 @@
-#include "cds/init.h"
 #include "io_buffer.h"
 #include "rapidjson/stringbuffer.h"
 #include "rpc.h"
@@ -16,6 +15,7 @@
 #include <exception>
 #include <fcntl.h>
 #include <fmt/format.h>
+#include <liburing/io_uring.h>
 #include <linux/time_types.h>
 #include <memory>
 #include <netinet/tcp.h>
@@ -36,6 +36,7 @@
 #include <uringpp/listener.h>
 #include <uringpp/socket.h>
 #include <uringpp/task.h>
+#include <vector>
 #include <zstd.h>
 
 using uringpp::task;
@@ -263,7 +264,8 @@ uringpp::task<void> send_chunks(uringpp::socket &conn,
 constexpr size_t kRPCReplyHeaderSize =
     sizeof(uint64_t) + sizeof(uint32_t) + sizeof(uint32_t);
 uringpp::task<void> rpc_reply(uringpp::socket &conn, uint64_t req_id,
-                              std::vector<char> data) {
+                              std::vector<char> data,
+                              bool reply_compressed = false) {
   char header[kRPCReplyHeaderSize];
   auto len = static_cast<uint32_t>(data.size());
   auto p = header;
@@ -271,19 +273,26 @@ uringpp::task<void> rpc_reply(uringpp::socket &conn, uint64_t req_id,
   p += sizeof(uint64_t);
   *(uint32_t *)p = len;
   p += sizeof(uint32_t);
-  std::vector<char> compressed(ZSTD_compressBound(data.size()));
-  auto compressed_size = [&]() {
-    return len > 0 ? ZSTD_compress(compressed.data(), compressed.size(),
-                                   data.data(), data.size(), 1)
-                   : 0;
+  auto body_pointer = &data[0];
+  auto [compressed, compressed_len] = [&]() {
+    if (!reply_compressed) {
+      return std::make_pair(std::vector<char>(), len);
+    }
+    std::vector<char> compressed(ZSTD_compressBound(data.size()));
+    uint32_t compressed_len = ZSTD_compress(
+        compressed.data(), compressed.size(), data.data(), data.size(), 1);
+    data.clear();
+    return std::make_pair(std::move(compressed), compressed_len);
   }();
-  data.clear();
-  *(uint32_t *)p = compressed_size;
+  if (!compressed.empty()) {
+    body_pointer = compressed.data();
+  }
+  *(uint32_t *)p = compressed_len;
   struct iovec iov[2];
   iov[0].iov_base = header;
   iov[0].iov_len = kRPCReplyHeaderSize;
-  iov[1].iov_base = const_cast<char *>(compressed.data());
-  iov[1].iov_len = compressed_size;
+  iov[1].iov_base = body_pointer;
+  iov[1].iov_len = compressed_len;
   co_await writev_all(conn, iov, 2);
 }
 
@@ -334,11 +343,20 @@ task<void> handle_rpc(uringpp::socket conn, size_t conn_id) {
       request.advance_write(n);
       continue;
     }
-    std::vector<char> decompressed(req_size);
-    auto decompressed_size = ZSTD_decompress(
-        decompressed.data(), req_size, request.read_data(), compressed_size);
-    assert(decompressed_size == req_size);
-    auto req_p = decompressed.data();
+    auto req_p = request.read_data();
+    auto [decompressed, decompressed_size] = [&]() {
+      if (m != method::batch && m != method::list) {
+        return std::make_pair(std::vector<char>(), req_size);
+      }
+      std::vector<char> decompressed(req_size);
+      uint32_t decompressed_size = ZSTD_decompress(
+          decompressed.data(), req_size, request.read_data(), compressed_size);
+      return std::make_pair(std::move(decompressed), decompressed_size);
+    }();
+    if (!decompressed.empty()) {
+      req_p = decompressed.data();
+      assert(decompressed_size == req_size);
+    }
     switch (m) {
     case method::query: {
       uint32_t key_size = *reinterpret_cast<uint32_t *>(req_p);
@@ -409,7 +427,7 @@ task<void> handle_rpc(uringpp::socket conn, size_t conn_id) {
         std::copy_n(v.value.data(), v.value.size(), p);
         p += v.value.size();
       }
-      co_await rpc_reply(conn, req_id, std::move(rep_body));
+      co_await rpc_reply(conn, req_id, std::move(rep_body), true);
     } break;
     case method::batch: {
       uint32_t count = *reinterpret_cast<uint32_t *>(req_p);
@@ -483,7 +501,7 @@ task<void> handle_rpc(uringpp::socket conn, size_t conn_id) {
           *reinterpret_cast<uint32_t *>(p) = sv.score;
           p += sizeof(uint32_t);
         }
-        co_await rpc_reply(conn, req_id, std::move(rep_body));
+        co_await rpc_reply(conn, req_id, std::move(rep_body), true);
       }
     } break;
     }
@@ -497,20 +515,33 @@ task<void> handle_rpc(uringpp::socket conn, size_t conn_id) {
 struct pending_call {
   std::coroutine_handle<> h;
   std::vector<char> response;
+  bool reply_compressed = false;
 };
 
 task<std::vector<char>> send_rpc_request(conn_pool &pool,
                                          std::vector<char> body,
                                          pending_call *pending, method m) {
   uint32_t req_size = body.size();
-  std::vector<char> compressed(ZSTD_compressBound(body.size()));
-  size_t compressed_len = ZSTD_compress(&compressed[0], compressed.size(),
-                                        &body[0], body.size(), 1);
-  if (ZSTD_isError(compressed_len)) {
-    fmt::print(stderr, "ZSTD_compress failed: {}\n",
-               ZSTD_getErrorName(compressed_len));
+  char *body_pointer = &body[0];
+  auto [compressed, compressed_len] = [&]() {
+    if (m != method::list && m != method::batch) {
+      return std::make_pair(std::vector<char>(), req_size);
+    }
+    std::vector<char> compressed(m == method::batch || m == method::list
+                                     ? ZSTD_compressBound(body.size())
+                                     : 0);
+    uint32_t compressed_len = ZSTD_compress(&compressed[0], compressed.size(),
+                                            &body[0], body.size(), 1);
+    if (ZSTD_isError(compressed_len)) {
+      fmt::print(stderr, "ZSTD_compress failed: {}\n",
+                 ZSTD_getErrorName(compressed_len));
+    }
+    body.clear();
+    return std::make_pair(std::move(compressed), compressed_len);
+  }();
+  if (!compressed.empty()) {
+    body_pointer = &compressed[0];
   }
-  body.clear();
   char header[kRPCRequestHeaderSize];
   auto p = &header[0];
   *reinterpret_cast<uint64_t *>(p) = reinterpret_cast<uint64_t>(pending);
@@ -524,7 +555,7 @@ task<std::vector<char>> send_rpc_request(conn_pool &pool,
   struct iovec iov[2];
   iov[0].iov_base = header;
   iov[0].iov_len = kRPCRequestHeaderSize;
-  iov[1].iov_base = (void *)&compressed[0];
+  iov[1].iov_base = body_pointer;
   iov[1].iov_len = compressed_len;
   auto conn = co_await pool.get_conn();
   co_await writev_all(*conn->conn, iov, 2);
@@ -534,8 +565,10 @@ task<std::vector<char>> send_rpc_request(conn_pool &pool,
 }
 
 task<std::vector<char>> rpc_call(conn_pool &pool, method m,
-                                 std::vector<char> body) {
+                                 std::vector<char> body,
+                                 bool reply_compressed = false) {
   auto pending = new pending_call;
+  pending->reply_compressed = reply_compressed;
   auto t = send_rpc_request(pool, std::move(body), pending, m);
   pending->h = t.h_;
   return t;
@@ -622,7 +655,7 @@ remote_list(conn_pool &pool, std::unordered_set<std::string_view> const &keys) {
     std::copy_n(key.data(), key.size(), body_p);
     body_p += key.size();
   }
-  auto response = co_await rpc_call(pool, method::list, std::move(body));
+  auto response = co_await rpc_call(pool, method::list, std::move(body), true);
   auto rep_p = response.data();
   auto rep_count = *reinterpret_cast<uint32_t *>(rep_p);
   rep_p += sizeof(uint32_t);
@@ -671,7 +704,8 @@ remote_zrange(conn_pool &pool, std::string_view key, uint32_t min_score,
   *reinterpret_cast<uint32_t *>(body_p) = min_score;
   body_p += sizeof(uint32_t);
   *reinterpret_cast<uint32_t *>(body_p) = max_score;
-  auto response = co_await rpc_call(pool, method::zrange, std::move(body));
+  auto response =
+      co_await rpc_call(pool, method::zrange, std::move(body), true);
   if (response.empty()) {
     co_return std::nullopt;
   }
@@ -752,13 +786,15 @@ task<void> rpc_reply_recv_loop(uringpp::socket &rpc_conn) {
     }
     auto pending = reinterpret_cast<pending_call *>(req_id);
     pending->response.resize(rep_size);
-    if (rep_size > 0) {
+    if (pending->reply_compressed && rep_size > 0) {
       assert(compressed_size > 0);
       auto decompressed_size =
           ZSTD_decompress(&pending->response[0], rep_size, response.read_data(),
                           compressed_size);
       assert(decompressed_size == rep_size);
       response.advance_read(compressed_size);
+    } else {
+      response.advance_read(rep_size);
     }
     pending->h.resume();
     delete pending;
@@ -1077,12 +1113,13 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
           auto doc = parser.parse(json);
           auto arr = doc.get_array().take_value();
           std::vector<std::vector<key_value_view>> sharded_keys(nr_peers);
+          auto batch = store->start_batch();
           for (auto &&kv : arr) {
             auto const key = kv["key"].get_string().take_value();
             auto const value = kv["value"].get_string().take_value();
             auto key_shard = get_shard(key);
             if (key_shard == me) {
-              store->add(key, value);
+              store->add_batch(batch, key, value);
             } else {
               sharded_keys[key_shard].emplace_back(key, value);
             }
@@ -1095,6 +1132,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
             tasks.emplace_back(remote_batch(rpc_clients[key_shard][conn_shard],
                                             sharded_keys[key_shard]));
           }
+          store->commit_batch(batch);
           for (auto &&task : tasks) {
             co_await task;
           }
@@ -1291,7 +1329,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
 }
 
 task<void> http_server(std::shared_ptr<loop_with_queue> loop) {
-  auto listener = uringpp::listener::listen(loop, "0.0.0.0", "8080");
+  auto listener = uringpp::listener::listen(loop, "0.0.0.0", "8080", 10000);
   size_t conn_id = 0;
   fmt::print("Starting HTTP server\n");
   while (true) {
@@ -1360,6 +1398,14 @@ task<void> connect_rpc_client(std::string port) {
   }
 }
 
+task<void> db_flusher(std::shared_ptr<loop_with_queue> loop) {
+  for (;;) {
+    struct __kernel_timespec ts = {0, 100000000};
+    co_await loop->timeout(&ts);
+    store->flush();
+  }
+}
+
 int main(int argc, char *argv[]) {
   main_loop = loop_with_queue::create(32768);
   main_loop->waker().detach();
@@ -1367,8 +1413,6 @@ int main(int argc, char *argv[]) {
   cores = get_cpu_affinity();
   loops.resize(cores.size());
   rpc_loops.resize(cores.size());
-  cds::Initialize();
-  cds::gc::HP hpGC;
   store = std::make_unique<storage>();
   {
     auto kv_thread = std::thread([]() { store->load_kv(); });
@@ -1376,19 +1420,11 @@ int main(int argc, char *argv[]) {
     kv_thread.join();
     zset_thread.join();
   }
-  auto flush_thread = std::thread([]() {
-    for (;;) {
-      store->flush();
-      std::this_thread::sleep_for(std::chrono::milliseconds(500));
-    }
-  });
-  flush_thread.detach();
   bind_cpu(cores[0]);
   for (int i = 0; i < cores.size(); ++i) {
     auto thread = std::thread([i, core = cores[i]] {
       fmt::print("thread {} bind to core {}\n", i, core);
       bind_cpu(core);
-      cds::threading::Manager::attachThread();
       auto loop = loop_with_queue::create(32768, IORING_SETUP_ATTACH_WQ,
                                           main_loop->fd());
       loops[i] = loop;
@@ -1408,7 +1444,6 @@ int main(int argc, char *argv[]) {
     auto thread = std::thread([i, core = cores[i]] {
       fmt::print("RPC Thread {} bind to core {}\n", i, core);
       bind_cpu(core);
-      cds::threading::Manager::attachThread();
       auto loop = loop_with_queue::create(32768, IORING_SETUP_ATTACH_WQ,
                                           main_loop->fd());
       rpc_loops[i] = loop;
@@ -1425,9 +1460,9 @@ int main(int argc, char *argv[]) {
   }
   rpc_server(main_loop, "58080").detach();
   http_server(main_loop).detach();
+  db_flusher(main_loop).detach();
   for (;;) {
     main_loop->poll();
   }
-  cds::Terminate();
   return 0;
 }

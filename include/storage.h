@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rocksdb/options.h"
+#include "rocksdb/write_batch.h"
 #include "rpc.h"
 #include "uringpp/task.h"
 #include "xxhash.h"
@@ -230,6 +231,10 @@ public:
 
   std::pair<char *, size_t> query(std::string_view key);
 
+  rocksdb::WriteBatch *start_batch();
+  void commit_batch(rocksdb::WriteBatch *batch);
+  void add_batch(rocksdb::WriteBatch *batch, std::string_view key,
+                 std::string_view value);
   void add_no_persist(std::string_view key, std::string_view value);
   void add(std::string_view key, std::string_view value);
   void del(std::string_view key);
