@@ -6,12 +6,17 @@ include(ExternalProject)
 include(ProcessorCount)
 ProcessorCount(N)
 
+
+if (CMAKE_CXX_COMPILER_ID MATCHES Clang)
+  set(ROCKSDB_USE_CLANG USE_CLANG=1 CC=clang CXX=clang++ "EXTRA_CXXFLAGS=-stdlib=libc++ -Wno-unused-but-set-variable")
+endif ()
+
 ExternalProject_Add(rocksdb_src
     PREFIX ${CMAKE_CURRENT_BINARY_DIR}/rocksdb
     URL ${CMAKE_CURRENT_LIST_DIR}/third_party/rocksdb
     BUILD_IN_SOURCE 1
     CONFIGURE_COMMAND ""
-    BUILD_COMMAND make -j${N} static_lib
+    BUILD_COMMAND  ${CMAKE_COMMAND} -E env ${ROCKSDB_USE_CLANG} make -j${N} static_lib
     INSTALL_COMMAND ""
     BUILD_BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/rocksdb/src/rocksdb_src/librocksdb.a"
 )
@@ -38,6 +43,11 @@ if(COMPILER_SUPPORTS_FLTO)
     endif()
 endif()
 
+if (CMAKE_CXX_COMPILER_ID MATCHES Clang)
+  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wunused-but-set-variable")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fcoroutines-ts -stdlib=libc++ -Wunused-but-set-variable")
+endif ()
+
 find_package(ZLIB)
 find_package(Boost)
 find_package(Threads)
@@ -46,15 +56,14 @@ add_subdirectory(third_party/uringpp)
 add_subdirectory(third_party/fmt)
 add_subdirectory(third_party/mimalloc)
 add_subdirectory(third_party/simdjson)
-add_subdirectory(third_party/f-stack-co)
 set(BUILD_EXAMPLES OFF)
 set(BUILD_TESTING OFF)
 include_directories(third_party/rapidjson/include)
 include_directories(third_party/uringpp/include)
-include_directories(third_party/f-stack-co/include)
 include_directories(include)
 
 add_library(hcache-common src/storage.cc src/threading.cc src/picohttpparser.c)
+add_dependencies(hcache-common rocksdb_src)
 target_link_libraries(hcache-common 
   PUBLIC        
     rocksdb
