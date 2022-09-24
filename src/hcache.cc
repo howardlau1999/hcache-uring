@@ -794,6 +794,8 @@ task<void> rpc_reply_recv_loop(uringpp::socket &rpc_conn) {
       assert(decompressed_size == rep_size);
       response.advance_read(compressed_size);
     } else {
+      pending->response.assign(response.read_data(),
+                               response.read_data() + rep_size);
       response.advance_read(rep_size);
     }
     pending->h.resume();
@@ -842,7 +844,7 @@ task<void> send_all(uringpp::socket &conn, const char *data, size_t size) {
 template <class It>
 task<void> send_score_values(uringpp::socket &conn, size_t count, It begin,
                              It end) {
-  if (count < 102400000) {
+  if (count < 1024) {
     // zrange
     rapidjson::StringBuffer buffer;
     auto d = rapidjson::Document();
@@ -1180,7 +1182,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
           if (local_key_values.empty() && remote_kv_count == 0) {
             co_await send_all(conn, HTTP_404, sizeof(HTTP_404) - 1);
           } else {
-            if (local_key_values.size() + remote_kv_count < 102400000) {
+            if (local_key_values.size() + remote_kv_count < 1024) {
               rapidjson::StringBuffer buffer;
               {
                 auto d = rapidjson::Document();
@@ -1213,7 +1215,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
             } else {
               co_await send_all(conn, CHUNK_RESPONSE,
                                 sizeof(CHUNK_RESPONSE) - 1);
-              constexpr size_t batch_size = 128;
+              constexpr size_t batch_size = 256;
               size_t batch_idx = 0;
               bool is_first = true;
               rapidjson::StringBuffer buffers[batch_size];
@@ -1290,7 +1292,6 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
               if (!score_values.has_value()) {
                 co_await send_all(conn, HTTP_404, sizeof(HTTP_404) - 1);
               } else {
-
                 co_await send_score_values(conn, score_values->size(),
                                            score_values->begin(),
                                            score_values->end());
