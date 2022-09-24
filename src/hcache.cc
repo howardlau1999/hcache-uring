@@ -660,33 +660,33 @@ task<void> remote_add(conn_pool &pool, std::string_view key,
   co_await rpc_call(pool, method::add, std::move(body));
 }
 
-task<void> evict_remote_key(size_t conn_shard) {
-  auto it = remote_cache.begin();
-  auto &key = it->key;
-  auto &value = it->value;
-  if (it->dirty) {
-    auto key_shard = get_shard(key);
-    auto &pool = rpc_clients[conn_shard][key_shard];
-    co_await remote_add(pool, key, value);
-  }
-  remote_cache.erase(it);
-  remote_cache_index.erase(key);
-}
+// task<void> evict_remote_key(size_t conn_shard) {
+//   auto it = remote_cache.begin();
+//   auto &key = it->key;
+//   auto &value = it->value;
+//   if (it->dirty) {
+//     auto key_shard = get_shard(key);
+//     auto &pool = rpc_clients[conn_shard][key_shard];
+//     co_await remote_add(pool, key, value);
+//   }
+//   remote_cache.erase(it);
+//   remote_cache_index.erase(key);
+// }
 
-task<void> insert_remote_cache(size_t conn_shard, std::string_view key,
-                               std::string_view value) {
-  auto it = remote_cache_index.find(key);
-  if (it != remote_cache_index.end()) {
-    it->second->value = value;
-    co_return;
-  }
-  if (remote_cache.size() >= 1024 * 1024) {
-    co_await evict_remote_key(conn_shard);
-  }
-  remote_cache.emplace_back(
-      cached_value{std::string(key), std::string(value), false});
-  remote_cache_index.emplace(std::string(key), std::prev(remote_cache.end()));
-}
+// task<void> insert_remote_cache(size_t conn_shard, std::string_view key,
+//                                std::string_view value) {
+//   auto it = remote_cache_index.find(key);
+//   if (it != remote_cache_index.end()) {
+//     it->second->value = value;
+//     co_return;
+//   }
+//   if (remote_cache.size() >= 1024 * 1024) {
+//     co_await evict_remote_key(conn_shard);
+//   }
+//   remote_cache.emplace_back(
+//       cached_value{std::string(key), std::string(value), false});
+//   remote_cache_index.emplace(std::string(key), std::prev(remote_cache.end()));
+// }
 
 task<void> remote_del(conn_pool &pool, std::string_view key) {
   auto body_size = key.size() + sizeof(uint32_t);
