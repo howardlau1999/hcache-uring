@@ -844,7 +844,7 @@ task<void> send_all(uringpp::socket &conn, const char *data, size_t size) {
 template <class It>
 task<void> send_score_values(uringpp::socket &conn, size_t count, It begin,
                              It end) {
-  if (count < 1024) {
+  if (count < 256) {
     // zrange
     rapidjson::StringBuffer buffer;
     auto d = rapidjson::Document();
@@ -867,7 +867,7 @@ task<void> send_score_values(uringpp::socket &conn, size_t count, It begin,
     co_await send_all(conn, CHUNK_RESPONSE, sizeof(CHUNK_RESPONSE) - 1);
     auto d = rapidjson::Document();
     auto &allocator = d.GetAllocator();
-    constexpr size_t batch_size = 512;
+    constexpr size_t batch_size = 64;
     rapidjson::StringBuffer buffers[batch_size];
     size_t batch_idx = 0;
     bool is_first = true;
@@ -1182,7 +1182,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
           if (local_key_values.empty() && remote_kv_count == 0) {
             co_await send_all(conn, HTTP_404, sizeof(HTTP_404) - 1);
           } else {
-            if (local_key_values.size() + remote_kv_count < 1024) {
+            if (local_key_values.size() + remote_kv_count < 128) {
               rapidjson::StringBuffer buffer;
               {
                 auto d = rapidjson::Document();
@@ -1215,7 +1215,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
             } else {
               co_await send_all(conn, CHUNK_RESPONSE,
                                 sizeof(CHUNK_RESPONSE) - 1);
-              constexpr size_t batch_size = 256;
+              constexpr size_t batch_size = 64;
               size_t batch_idx = 0;
               bool is_first = true;
               rapidjson::StringBuffer buffers[batch_size];
