@@ -11,6 +11,9 @@ enum method : uint8_t {
   zadd,
   zrange,
   zrmv,
+  ccache,
+  cevict,
+  cupdate,
 };
 
 struct key_value {

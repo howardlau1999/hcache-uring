@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <bits/types/struct_iovec.h>
+#include <bitset>
 #include <cassert>
 #include <chrono>
 #include <coroutine>
@@ -40,6 +41,17 @@
 #include <zstd.h>
 
 using uringpp::task;
+
+struct cached_value {
+  std::string key;
+  std::string value;
+  std::bitset<32> cached_peers;
+  bool dirty = false;
+};
+
+std::list<cached_value> remote_cache;
+std::shared_mutex remote_cache_mutex;
+unordered_string_map<std::list<cached_value>::iterator> remote_cache_index;
 
 struct send_conn_state {
   std::unique_ptr<uringpp::socket> conn;
@@ -543,6 +555,9 @@ task<void> handle_rpc(uringpp::socket conn, size_t conn_id) {
         co_await rpc_reply(conn, req_id, std::move(rep_body), true);
       }
     } break;
+    default: {
+      co_await rpc_reply_empty(conn, req_id);
+    }
     }
     request.advance_read(compressed_size);
     state = kStateRecvHeader;
@@ -643,6 +658,34 @@ task<void> remote_add(conn_pool &pool, std::string_view key,
   body_p += sizeof(uint32_t);
   std::copy_n(value.data(), value.size(), body_p);
   co_await rpc_call(pool, method::add, std::move(body));
+}
+
+task<void> evict_remote_key(size_t conn_shard) {
+  auto it = remote_cache.begin();
+  auto &key = it->key;
+  auto &value = it->value;
+  if (it->dirty) {
+    auto key_shard = get_shard(key);
+    auto &pool = rpc_clients[conn_shard][key_shard];
+    co_await remote_add(pool, key, value);
+  }
+  remote_cache.erase(it);
+  remote_cache_index.erase(key);
+}
+
+task<void> insert_remote_cache(size_t conn_shard, std::string_view key,
+                               std::string_view value) {
+  auto it = remote_cache_index.find(key);
+  if (it != remote_cache_index.end()) {
+    it->second->value = value;
+    co_return;
+  }
+  if (remote_cache.size() >= 1024 * 1024) {
+    co_await evict_remote_key(conn_shard);
+  }
+  remote_cache.emplace_back(
+      cached_value{std::string(key), std::string(value), false});
+  remote_cache_index.emplace(std::string(key), std::prev(remote_cache.end()));
 }
 
 task<void> remote_del(conn_pool &pool, std::string_view key) {
@@ -868,7 +911,7 @@ task<void> rpc_server(std::shared_ptr<loop_with_queue> loop, std::string port) {
 template <class It>
 task<void> send_score_values(uringpp::socket &conn, size_t count, It begin,
                              It end) {
-  if (count < 256) {
+  if (count < 512) {
     // zrange
     rapidjson::StringBuffer buffer;
     auto d = rapidjson::Document();
@@ -1206,7 +1249,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
           if (local_key_values.empty() && remote_kv_count == 0) {
             co_await send_all(conn, HTTP_404, sizeof(HTTP_404) - 1);
           } else {
-            if (local_key_values.size() + remote_kv_count < 128) {
+            if (local_key_values.size() + remote_kv_count < 512) {
               rapidjson::StringBuffer buffer;
               {
                 auto d = rapidjson::Document();
