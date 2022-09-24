@@ -911,7 +911,7 @@ task<void> rpc_server(std::shared_ptr<loop_with_queue> loop, std::string port) {
 template <class It>
 task<void> send_score_values(uringpp::socket &conn, size_t count, It begin,
                              It end) {
-  if (count < 512) {
+  if (count < 512000000) {
     // zrange
     rapidjson::StringBuffer buffer;
     auto d = rapidjson::Document();
@@ -1249,7 +1249,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
           if (local_key_values.empty() && remote_kv_count == 0) {
             co_await send_all(conn, HTTP_404, sizeof(HTTP_404) - 1);
           } else {
-            if (local_key_values.size() + remote_kv_count < 512) {
+            if (local_key_values.size() + remote_kv_count < 512000000) {
               rapidjson::StringBuffer buffer;
               {
                 auto d = rapidjson::Document();
@@ -1469,7 +1469,7 @@ task<void> connect_rpc_client(std::string port) {
 void db_flusher() {
   std::thread([] {
     while (true) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(500));
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
       store->flush();
     }
   }).detach();
