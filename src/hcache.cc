@@ -1499,7 +1499,7 @@ int main(int argc, char *argv[]) {
       fmt::print("thread {} bind to core {}\n", i, core);
       bind_cpu(core);
       auto loop = loop_with_queue::create(
-          32768, IORING_SETUP_SQPOLL | IORING_SETUP_SQ_AFF, -1, core, 1000);
+          32768, IORING_SETUP_SQPOLL | IORING_SETUP_SQ_AFF | IORING_SETUP_ATTACH_WQ, main_loop->fd(), core, 1000);
       loops[i] = loop;
       rpc_loops[i] = loop;
       loop_started.fetch_add(1);
