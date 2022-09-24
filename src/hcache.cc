@@ -842,7 +842,7 @@ task<void> send_all(uringpp::socket &conn, const char *data, size_t size) {
 template <class It>
 task<void> send_score_values(uringpp::socket &conn, size_t count, It begin,
                              It end) {
-  if (count < 1024) {
+  if (count < 102400000) {
     // zrange
     rapidjson::StringBuffer buffer;
     auto d = rapidjson::Document();
@@ -1180,7 +1180,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
           if (local_key_values.empty() && remote_kv_count == 0) {
             co_await send_all(conn, HTTP_404, sizeof(HTTP_404) - 1);
           } else {
-            if (local_key_values.size() + remote_kv_count < 1024) {
+            if (local_key_values.size() + remote_kv_count < 102400000) {
               rapidjson::StringBuffer buffer;
               {
                 auto d = rapidjson::Document();
