@@ -48,7 +48,7 @@ struct send_conn_state {
 task<void> rpc_reply_recv_loop(uringpp::socket &rpc_conn);
 
 struct conn_pool {
-  static constexpr size_t kMaxConns = 128;
+  static constexpr size_t kMaxConns = 2048;
   std::shared_ptr<loop_with_queue> loop;
   std::queue<std::coroutine_handle<>> waiters;
   std::string host;
