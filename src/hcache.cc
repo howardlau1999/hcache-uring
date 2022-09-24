@@ -1266,7 +1266,7 @@ task<void> connect_rpc_client(std::string port);
 
 task<void> rpc_server(std::shared_ptr<loop_with_queue> loop, std::string port) {
   size_t rpc_conn_id = 0;
-  auto listener = uringpp::listener::listen(loop, "0.0.0.0", port);
+  auto listener = uringpp::listener::listen(loop, "0.0.0.0", port, 8192);
   fmt::print("Starting RPC server\n");
   connect_rpc_client(port).detach();
   while (true) {
@@ -1795,7 +1795,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
 }
 
 task<void> http_server(std::shared_ptr<loop_with_queue> loop) {
-  auto listener = uringpp::listener::listen(loop, "0.0.0.0", "8080");
+  auto listener = uringpp::listener::listen(loop, "0.0.0.0", "8080", 8192);
   size_t conn_id = 0;
   fmt::print("Starting HTTP server\n");
   while (true) {
