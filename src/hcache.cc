@@ -1401,7 +1401,7 @@ task<void> connect_rpc_client(std::string port) {
 
 task<void> db_flusher(std::shared_ptr<loop_with_queue> loop) {
   for (;;) {
-    struct __kernel_timespec ts = {0, 100000000};
+    struct __kernel_timespec ts = {0, 1000000000};
     co_await loop->timeout(&ts);
     store->flush();
   }
