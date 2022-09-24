@@ -354,7 +354,7 @@ constexpr size_t kRPCRequestHeaderSize =
     sizeof(uint64_t) + sizeof(method) + sizeof(uint32_t) + sizeof(uint32_t);
 
 task<void> handle_rpc(uringpp::socket conn, size_t conn_id) {
-  auto loop = rpc_loops[conn_id % rpc_loops.size()];
+  auto loop = rpc_loops[(conn_id % (rpc_loops.size() - 1)) + 1];
   co_await loop->switch_to_io_thread();
   io_buffer request(65536);
   int state = kStateRecvHeader;
@@ -685,7 +685,8 @@ task<void> remote_add(conn_pool &pool, std::string_view key,
 //   }
 //   remote_cache.emplace_back(
 //       cached_value{std::string(key), std::string(value), false});
-//   remote_cache_index.emplace(std::string(key), std::prev(remote_cache.end()));
+//   remote_cache_index.emplace(std::string(key),
+//   std::prev(remote_cache.end()));
 // }
 
 task<void> remote_del(conn_pool &pool, std::string_view key) {
@@ -896,8 +897,8 @@ task<void> rpc_server(std::shared_ptr<loop_with_queue> loop, std::string port) {
   fmt::print("Starting RPC server\n");
   connect_rpc_client(port).detach();
   while (true) {
-    auto [addr, conn] =
-        co_await listener.accept(rpc_loops[rpc_conn_id % rpc_loops.size()]);
+    auto [addr, conn] = co_await listener.accept(
+        rpc_loops[(rpc_conn_id % (rpc_loops.size() - 1)) + 1]);
     {
       int flags = 1;
       setsockopt(conn.fd(), SOL_TCP, TCP_NODELAY, (void *)&flags,
@@ -911,7 +912,7 @@ task<void> rpc_server(std::shared_ptr<loop_with_queue> loop, std::string port) {
 template <class It>
 task<void> send_score_values(uringpp::socket &conn, size_t count, It begin,
                              It end) {
-  if (count < 512000000) {
+  if (count < 512) {
     // zrange
     rapidjson::StringBuffer buffer;
     auto d = rapidjson::Document();
@@ -968,7 +969,7 @@ task<void> send_score_values(uringpp::socket &conn, size_t count, It begin,
 }
 
 task<void> handle_http(uringpp::socket conn, size_t conn_id) {
-  auto conn_shard = conn_id % loops.size();
+  auto conn_shard = (conn_id % (loops.size() - 1)) + 1;
   auto loop = loops[conn_shard];
   co_await loop->switch_to_io_thread();
   try {
@@ -1249,7 +1250,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
           if (local_key_values.empty() && remote_kv_count == 0) {
             co_await send_all(conn, HTTP_404, sizeof(HTTP_404) - 1);
           } else {
-            if (local_key_values.size() + remote_kv_count < 512000000) {
+            if (local_key_values.size() + remote_kv_count < 512) {
               rapidjson::StringBuffer buffer;
               {
                 auto d = rapidjson::Document();
@@ -1403,7 +1404,7 @@ task<void> http_server(std::shared_ptr<loop_with_queue> loop) {
   while (true) {
     try {
       auto [addr, conn] =
-          co_await listener.accept(loops[conn_id % loops.size()]);
+          co_await listener.accept(loops[(conn_id % (loops.size() - 1)) + 1]);
       {
         int flags = 1;
         setsockopt(conn.fd(), SOL_TCP, TCP_NODELAY, (void *)&flags,
@@ -1499,7 +1500,7 @@ int main(int argc, char *argv[]) {
       fmt::print("thread {} bind to core {}\n", i, core);
       bind_cpu(core);
       auto loop = loop_with_queue::create(
-          32768, IORING_SETUP_SQPOLL | IORING_SETUP_SQ_AFF | IORING_SETUP_ATTACH_WQ, main_loop->fd(), core, 1000);
+          32768, IORING_SETUP_ATTACH_WQ | IORING_SETUP_SQPOLL, main_loop->fd());
       loops[i] = loop;
       rpc_loops[i] = loop;
       loop_started.fetch_add(1);
