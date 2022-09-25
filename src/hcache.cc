@@ -912,7 +912,7 @@ task<void> rpc_server(std::shared_ptr<loop_with_queue> loop, std::string port) {
 template <class It>
 task<void> send_score_values(uringpp::socket &conn, size_t count, It begin,
                              It end) {
-  if (count < 512) {
+  if (count < 256) {
     // zrange
     rapidjson::StringBuffer buffer;
     auto d = rapidjson::Document();
@@ -935,7 +935,7 @@ task<void> send_score_values(uringpp::socket &conn, size_t count, It begin,
     co_await send_all(conn, CHUNK_RESPONSE, sizeof(CHUNK_RESPONSE) - 1);
     auto d = rapidjson::Document();
     auto &allocator = d.GetAllocator();
-    constexpr size_t batch_size = 64;
+    constexpr size_t batch_size = 256;
     rapidjson::StringBuffer buffers[batch_size];
     size_t batch_idx = 0;
     bool is_first = true;
@@ -1250,7 +1250,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
           if (local_key_values.empty() && remote_kv_count == 0) {
             co_await send_all(conn, HTTP_404, sizeof(HTTP_404) - 1);
           } else {
-            if (local_key_values.size() + remote_kv_count < 512) {
+            if (local_key_values.size() + remote_kv_count < 256) {
               rapidjson::StringBuffer buffer;
               {
                 auto d = rapidjson::Document();
@@ -1283,7 +1283,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
             } else {
               co_await send_all(conn, CHUNK_RESPONSE,
                                 sizeof(CHUNK_RESPONSE) - 1);
-              constexpr size_t batch_size = 64;
+              constexpr size_t batch_size = 256;
               size_t batch_idx = 0;
               bool is_first = true;
               rapidjson::StringBuffer buffers[batch_size];
