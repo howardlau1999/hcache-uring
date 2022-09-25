@@ -1470,7 +1470,7 @@ task<void> connect_rpc_client(std::string port) {
 void db_flusher() {
   std::thread([] {
     while (true) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
       store->flush();
     }
   }).detach();
@@ -1506,7 +1506,7 @@ int main(int argc, char *argv[]) {
       loop_started.fetch_add(1);
       loop->waker().detach();
       for (;;) {
-        loop->poll();
+        loop->poll_no_wait();
       }
     });
     thread.detach();
