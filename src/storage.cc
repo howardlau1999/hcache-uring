@@ -185,9 +185,8 @@ size_t storage::get_key_shard(std::string_view key) const {
   return XXH64(key.data(), key.size(), 19260817) % nr_shards;
 }
 
-std::pair<char *, size_t> storage::query(std::string_view key) {
-  size_t ret_size = 0;
-  char *ret_value = nullptr;
+std::optional<std::string> storage::query(std::string_view key) {
+  std::optional<std::string> ret = std::nullopt;
   // kvs_.find(key, [&](auto &kv, ...) {
   //   ret_value = new char[kv.value.size()];
   //   ret_size = kv.value.size();
@@ -198,12 +197,10 @@ std::pair<char *, size_t> storage::query(std::string_view key) {
     std::shared_lock lock(kvs_mutex_[shard]);
     auto it = kvs_[shard].find(key);
     if (it != kvs_[shard].end()) {
-      ret_value = new char[it->second.size()];
-      ret_size = it->second.size();
-      std::copy_n(it->second.data(), it->second.size(), ret_value);
+      ret = it->second;   
     }
   }
-  return {ret_value, ret_size};
+  return ret;
 }
 
 void storage::add_no_persist(std::string_view key, std::string_view value) {

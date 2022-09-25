@@ -191,7 +191,7 @@ constexpr int kStateProcess = 2;
 task<void> send_all(uringpp::socket &conn, const char *data, size_t size) {
   while (size > 0) {
     auto n = co_await conn.send(data, size, MSG_NOSIGNAL);
-    if (n <= 0) {
+    if (n <= 0) [[unlikely]] {
       if (n < 0) {
         fmt::print("send error: {}\n", strerror(-n));
       }
@@ -212,7 +212,7 @@ uringpp::task<void> writev_all(uringpp::socket &conn, struct iovec *iov,
   size_t written = 0;
   while (written < total) {
     auto n = co_await conn.writev(iov, iovcnt);
-    if (n <= 0) {
+    if (n <= 0) [[unlikely]] {
       break;
     }
     written += n;
@@ -418,8 +418,8 @@ task<void> handle_rpc(uringpp::socket conn, size_t conn_id) {
       std::string_view key(req_p, key_size);
       req_p += key_size;
       auto value = store->query(key);
-      if (value.first) [[likely]] {
-        co_await rpc_reply_simple(conn, req_id, value.first, value.second);
+      if (value.has_value()) [[likely]] {
+        co_await rpc_reply_simple(conn, req_id, value->data(), value->size());
       } else {
         co_await rpc_reply_empty(conn, req_id);
       }
@@ -660,34 +660,33 @@ task<void> remote_add(conn_pool &pool, std::string_view key,
   co_await rpc_call(pool, method::add, std::move(body));
 }
 
-// task<void> evict_remote_key(size_t conn_shard) {
-//   auto it = remote_cache.begin();
-//   auto &key = it->key;
-//   auto &value = it->value;
-//   if (it->dirty) {
-//     auto key_shard = get_shard(key);
-//     auto &pool = rpc_clients[conn_shard][key_shard];
-//     co_await remote_add(pool, key, value);
-//   }
-//   remote_cache.erase(it);
-//   remote_cache_index.erase(key);
-// }
+task<void> evict_remote_key(size_t conn_shard) {
+  auto it = remote_cache.begin();
+  auto &key = it->key;
+  auto &value = it->value;
+  if (it->dirty) {
+    auto key_shard = get_shard(key);
+    auto &pool = rpc_clients[conn_shard][key_shard];
+    co_await remote_add(pool, key, value);
+  }
+  remote_cache.erase(it);
+  remote_cache_index.erase(key);
+}
 
-// task<void> insert_remote_cache(size_t conn_shard, std::string_view key,
-//                                std::string_view value) {
-//   auto it = remote_cache_index.find(key);
-//   if (it != remote_cache_index.end()) {
-//     it->second->value = value;
-//     co_return;
-//   }
-//   if (remote_cache.size() >= 1024 * 1024) {
-//     co_await evict_remote_key(conn_shard);
-//   }
-//   remote_cache.emplace_back(
-//       cached_value{std::string(key), std::string(value), false});
-//   remote_cache_index.emplace(std::string(key),
-//   std::prev(remote_cache.end()));
-// }
+task<void> insert_remote_cache(size_t conn_shard, std::string_view key,
+                               std::string_view value) {
+  auto it = remote_cache_index.find(key);
+  if (it != remote_cache_index.end()) {
+    it->second->value = value;
+    co_return;
+  }
+  if (remote_cache.size() >= 1024 * 1024) {
+    co_await evict_remote_key(conn_shard);
+  }
+  remote_cache.emplace_back(
+      cached_value{std::string(key), std::string(value), false});
+  remote_cache_index.emplace(std::string(key), std::prev(remote_cache.end()));
+}
 
 task<void> remote_del(conn_pool &pool, std::string_view key) {
   auto body_size = key.size() + sizeof(uint32_t);
@@ -1068,26 +1067,23 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
         case 'q': {
           // query
           std::string_view key(path + 7, path_len - 7);
-          std::pair<char *, size_t> value;
           auto key_shard = get_shard(key);
           if (key_shard == me) {
-            value = store->query(key);
-          } else {
-            auto remote_value =
-                co_await remote_query(rpc_clients[key_shard][conn_shard], key);
-            if (!remote_value.has_value()) {
-              value.first = nullptr;
+            auto value = store->query(key);
+            if (!value.has_value()) {
+              co_await send_all(conn, HTTP_404, sizeof(HTTP_404) - 1);
             } else {
-              value.first = new char[remote_value.value().second.size()];
-              value.second = remote_value.value().second.size();
-              std::copy_n(remote_value.value().second.data(),
-                          remote_value.value().second.size(), value.first);
+              co_await send_all(conn, value->data(), value->size());
             }
-          }
-          if (!value.first) {
-            co_await send_all(conn, HTTP_404, sizeof(HTTP_404) - 1);
           } else {
-            co_await send_text(conn, value.first, value.second);
+            auto value =
+                co_await remote_query(rpc_clients[key_shard][conn_shard], key);
+            if (!value.has_value()) {
+              co_await send_all(conn, HTTP_404, sizeof(HTTP_404) - 1);
+            } else {
+              co_await send_all(conn, value->second.data(),
+                                value->second.size());
+            }
           }
         } break;
         case 'd': {
@@ -1470,7 +1466,7 @@ task<void> connect_rpc_client(std::string port) {
 void db_flusher() {
   std::thread([] {
     while (true) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      std::this_thread::sleep_for(std::chrono::milliseconds(500));
       store->flush();
     }
   }).detach();
@@ -1506,7 +1502,7 @@ int main(int argc, char *argv[]) {
       loop_started.fetch_add(1);
       loop->waker().detach();
       for (;;) {
-        loop->poll_no_wait();
+        loop->poll();
       }
     });
     thread.detach();
@@ -1514,25 +1510,6 @@ int main(int argc, char *argv[]) {
   while (loop_started.load() != cores.size()) {
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
-  // loop_started = 0;
-  // for (int i = 0; i < cores.size(); ++i) {
-  //   auto thread = std::thread([i, core = cores[i]] {
-  //     fmt::print("RPC Thread {} bind to core {}\n", i, core);
-  //     bind_cpu(core);
-  //     auto loop = loop_with_queue::create(32768, IORING_SETUP_ATTACH_WQ,
-  //                                         main_loop->fd());
-  //     rpc_loops[i] = loop;
-  //     loop_started.fetch_add(1);
-  //     loop->waker().detach();
-  //     for (;;) {
-  //       loop->poll();
-  //     }
-  //   });
-  //   thread.detach();
-  // }
-  // while (loop_started.load() != cores.size()) {
-  //   std::this_thread::sleep_for(std::chrono::milliseconds(10));
-  // }
   rpc_server(main_loop, "58080").detach();
   http_server(main_loop).detach();
   db_flusher();

@@ -210,8 +210,8 @@ public:
        std::unordered_set<std::string_view>::iterator end) {
     std::vector<key_view_value> ret;
     for (auto it = begin; it != end; ++it) {
-      if (auto v = query(*it); v.first) {
-        ret.emplace_back(*it, std::string(v.first, v.second));
+      if (auto v = query(*it); v.has_value()) {
+        ret.emplace_back(*it, v.value());
       }
     }
     return ret;
@@ -222,14 +222,14 @@ public:
        std::vector<std::string_view>::iterator end) {
     std::vector<key_view_value> ret;
     for (auto it = begin; it != end; ++it) {
-      if (auto v = query(*it); v.first) {
-        ret.emplace_back(std::move(*it), std::string(v.first, v.second));
+      if (auto v = query(*it); v.has_value()) {
+        ret.emplace_back(std::move(*it), v.value());
       }
     }
     return ret;
   }
 
-  std::pair<char *, size_t> query(std::string_view key);
+  std::optional<std::string> query(std::string_view key);
 
   rocksdb::WriteBatch *start_batch();
   void commit_batch(rocksdb::WriteBatch *batch);
