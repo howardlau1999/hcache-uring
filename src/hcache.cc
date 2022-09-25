@@ -47,7 +47,6 @@ struct cached_value {
   std::string key;
   std::string value;
   std::bitset<32> cached_peers;
-  bool dirty = false;
 };
 
 std::list<cached_value> remote_cache;
@@ -670,34 +669,35 @@ task<bool> remote_add(conn_pool &pool, std::string_view key,
   co_return success;
 }
 
-task<void> evict_remote_key(size_t conn_shard) {
-  auto it = remote_cache.begin();
-  auto &key = it->key;
-  auto &value = it->value;
-  if (it->dirty) {
-    auto key_shard = get_shard(key);
-    auto &pool = rpc_clients[conn_shard][key_shard];
-    co_await remote_add(pool, key, value);
-  }
-  remote_cache.erase(it);
-  remote_cache_index.erase(key);
+task<void> remote_cache_update(conn_pool &pool, std::string key,
+                               std::string value) {
+  auto body_size = key.size() + value.size() + sizeof(uint32_t) * 2;
+  auto body = std::vector<char>(body_size);
+  auto body_p = &body[0];
+  *reinterpret_cast<uint32_t *>(body_p) = key.size();
+  body_p += sizeof(uint32_t);
+  std::copy_n(key.data(), key.size(), body_p);
+  body_p += key.size();
+  *reinterpret_cast<uint32_t *>(body_p) = value.size();
+  body_p += sizeof(uint32_t);
+  std::copy_n(value.data(), value.size(), body_p);
+  co_await rpc_call(pool, method::cupdate, std::move(body));
 }
 
-task<void> insert_remote_cache(size_t conn_shard, std::string key,
+task<void> notify_cache_update(size_t peer, size_t conn_shard, std::string key,
                                std::string value) {
-  auto it = remote_cache_index.find(key);
-  if (it != remote_cache_index.end()) {
-    it->second->value = value;
-    co_return;
+  return remote_cache_update(rpc_clients[peer][conn_shard], key, value);
+}
+
+task<void> broadcast_key_update(size_t key_shard, size_t conn_shard,
+                                std::bitset<32> cached_peers, std::string key, std::string value) {
+  co_await remote_add(rpc_clients[key_shard][conn_shard], key, value);
+  for (auto i = 0; i < nr_peers; ++i) {
+    if (i == me || i == key_shard || !cached_peers[i]) {
+      continue;
+    }
+    notify_cache_update(i, conn_shard, key, value).detach();
   }
-  if (remote_cache.size() >= 1024 * 1024) {
-    co_await evict_remote_key(conn_shard);
-  }
-  auto cv = cached_value{};
-  cv.key = key;
-  cv.value = std::move(value);
-  remote_cache.emplace_back(std::move(cv));
-  remote_cache_index.emplace(std::move(key), std::prev(remote_cache.end()));
 }
 
 task<void> remote_del(conn_pool &pool, std::string_view key) {
@@ -709,6 +709,44 @@ task<void> remote_del(conn_pool &pool, std::string_view key) {
   std::copy_n(key.data(), key.size(), body_p);
   co_await rpc_call(pool, method::del, std::move(body));
 }
+
+task<void> broadcast_key_remove_cache(size_t key_shard, size_t conn_shard,std::bitset<32> cached_peers, std::string key) {
+  co_await remote_del(rpc_clients[key_shard][conn_shard], key);
+}
+
+task<void> evict_remote_key(size_t conn_shard) {
+  auto it = remote_cache.begin();
+  auto &key = it->key;
+  auto &cached_peers = it->cached_peers;
+  auto key_shard = get_shard(key);
+  co_await broadcast_key_remove_cache(key_shard, conn_shard, cached_peers, key);
+  remote_cache.erase(it);
+  remote_cache_index.erase(key);
+}
+
+task<void> insert_remote_cache(size_t key_shard, size_t conn_shard,
+                               std::string key, std::string value) {
+  {
+    std::shared_lock lock(remote_cache_mutex);
+    auto it = remote_cache_index.find(key);
+    if (it != remote_cache_index.end()) {
+      it->second->value = value;
+      co_return;
+    }
+  }
+  if (remote_cache.size() >= 1024 * 1024) {
+    co_await evict_remote_key(conn_shard);
+  }
+  auto cv = cached_value{};
+  cv.key = key;
+  cv.value = std::move(value);
+  {
+    std::unique_lock lock(remote_cache_mutex);
+    remote_cache.emplace_back(std::move(cv));
+    remote_cache_index.emplace(std::move(key), std::prev(remote_cache.end()));
+  }
+}
+
 
 task<void> remote_batch(
     conn_pool &pool,
