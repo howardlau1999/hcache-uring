@@ -1,6 +1,7 @@
 #include "storage.h"
 #include "rocksdb/db.h"
 #include "rocksdb/options.h"
+#include "rocksdb/slice.h"
 #include "rocksdb/sst_file_writer.h"
 
 #include <boost/algorithm/string/classification.hpp>
@@ -172,10 +173,18 @@ void storage::load_zset() {
   auto count = 0;
   for (it->SeekToFirst(); it->Valid(); it->Next()) {
     auto full_key = it->key();
-    auto score_raw = it->value();
-    auto score = *reinterpret_cast<uint32_t const *>(score_raw.data());
     auto [key, value] = decode_zset_key(full_key);
-    zadd_no_persist(key, value, score);
+    if (value.size() == 0) {
+      auto shard = get_key_shard(key);
+      {
+        std::lock_guard lock(zsets_mutex_[shard]);
+        zsets_[shard].insert({std::string(key), std::make_unique<zset_stl>()});
+      }
+    } else {
+      auto score_raw = it->value();
+      auto score = *reinterpret_cast<uint32_t const *>(score_raw.data());
+      zadd_no_persist(key, value, score);
+    }
     count++;
   }
   fmt::print("Loaded {} ZSET keys\n", count);
@@ -197,13 +206,13 @@ std::optional<std::string> storage::query(std::string_view key) {
     std::shared_lock lock(kvs_mutex_[shard]);
     auto it = kvs_[shard].find(key);
     if (it != kvs_[shard].end()) {
-      ret = it->second;   
+      ret = it->second;
     }
   }
   return ret;
 }
 
-void storage::add_no_persist(std::string_view key, std::string_view value) {
+bool storage::add_no_persist(std::string_view key, std::string_view value) {
   // if (kvs_.find(key, [value](auto &kv, ...) {
   //       kv.value.assign(value.begin(), value.end());
   //     })) {
@@ -219,10 +228,17 @@ void storage::add_no_persist(std::string_view key, std::string_view value) {
   // if (!is_new) {
   //   mi_disposer<key_value_intl>()(kv);
   // }
+  auto shard = get_key_shard(key);
   {
-    auto shard = get_key_shard(key);
+    std::shared_lock lock(zsets_mutex_[shard]);
+    if (auto it = zsets_[shard].find(key); it != zsets_[shard].end()) {
+      return false;
+    }
+  }
+  {
     std::unique_lock lock(kvs_mutex_[shard]);
     kvs_[shard].insert({std::string(key), std::string(value)});
+    return true;
   }
 }
 
@@ -240,9 +256,12 @@ void storage::add_batch(rocksdb::WriteBatch *batch, std::string_view key,
   batch->Put(key, value);
 }
 
-void storage::add(std::string_view key, std::string_view value) {
-  add_no_persist(key, value);
+bool storage::add(std::string_view key, std::string_view value) {
+  if (!add_no_persist(key, value)) {
+    return false;
+  }
   kv_db_->Put(write_options_, key, value);
+  return true;
 }
 
 void storage::del(std::string_view key) {
@@ -254,11 +273,14 @@ void storage::del(std::string_view key) {
   //   mi_disposer<zset_intl>()(p);
   // }
   auto shard = get_key_shard(key);
+  bool remove_kv = false;
+  bool remove_zset = false;
   {
     std::unique_lock lock(kvs_mutex_[shard]);
     auto it = kvs_[shard].find(key);
     if (it != kvs_[shard].end()) {
       kvs_[shard].erase(it);
+      remove_kv = true;
     }
   }
   {
@@ -266,9 +288,28 @@ void storage::del(std::string_view key) {
     auto it = zsets_[shard].find(key);
     if (it != zsets_[shard].end()) {
       zsets_[shard].erase(it);
+      remove_zset = true;
     }
   }
-  kv_db_->Delete(write_options_, key);
+  if (remove_kv) {
+    kv_db_->Delete(write_options_, key);
+  }
+  if (remove_zset) {
+    std::vector<char> prefix(key.begin(), key.end());
+    prefix.push_back(0);
+    auto prefix_sv = std::string_view(prefix.data(), prefix.size());
+    auto it = std::unique_ptr<rocksdb::Iterator>(
+        zset_db_->NewIterator(get_bulk_read_options()));
+    it->Seek(rocksdb::Slice(prefix.data(), prefix.size()));
+    while (it->Valid()) {
+      auto full_key = it->key();
+      if (!full_key.ToStringView().starts_with(prefix_sv)) {
+        break;
+      }
+      zset_db_->Delete(write_options_, full_key);
+      it->Next();
+    }
+  }
 }
 
 void zset_stl::zadd(uint32_t score, std::string_view value) {
@@ -287,7 +328,7 @@ void zset_stl::zadd(uint32_t score, std::string_view value) {
   }
 }
 
-void storage::zadd_no_persist(std::string_view key, std::string_view value,
+bool storage::zadd_no_persist(std::string_view key, std::string_view value,
                               uint32_t score) {
   // if (zsets_.find(key, [value, score](zset_intl &zset, ...) {
   //       zset.zadd(score, value);
@@ -309,6 +350,7 @@ void storage::zadd_no_persist(std::string_view key, std::string_view value,
   //   mi_disposer<zset_intl>()(zset);
   // }
   auto shard = get_key_shard(key);
+  bool is_new = false;
   {
     std::unique_lock lock(zsets_mutex_[shard]);
     auto it = zsets_[shard].find(key);
@@ -318,17 +360,35 @@ void storage::zadd_no_persist(std::string_view key, std::string_view value,
       auto zset = std::make_unique<zset_stl>();
       zset->zadd(score, value);
       zsets_[shard].insert({std::string(key), std::move(zset)});
+      is_new = true;
     }
   }
+  return is_new;
 }
 
-void storage::zadd(std::string_view key, std::string_view value,
+bool storage::zadd(std::string_view key, std::string_view value,
                    uint32_t score) {
-  zadd_no_persist(key, value, score);
+  {
+    auto shard = get_key_shard(key);
+    std::shared_lock lock(kvs_mutex_[shard]);
+    auto it = kvs_[shard].find(key);
+    if (it != kvs_[shard].end()) {
+      return false;
+    }
+  }
+  bool is_new = zadd_no_persist(key, value, score);
+  if (is_new) {
+    std::vector<char> placeholder(key.begin(), key.end());
+    placeholder.push_back(0);
+    zset_db_->Put(write_options_,
+                  rocksdb::Slice(placeholder.data(), placeholder.size()),
+                  rocksdb::Slice());
+  }
   auto full_key = encode_zset_key(key, value);
   zset_db_->Put(
       write_options_, rocksdb::Slice(full_key.data(), full_key.size()),
       rocksdb::Slice(reinterpret_cast<const char *>(&score), sizeof(score)));
+  return true;
 }
 
 void storage::zrmv(std::string_view key, std::string_view value) {

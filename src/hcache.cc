@@ -31,6 +31,7 @@
 #include <strings.h>
 #include <sys/socket.h>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <uringpp/event_loop.h>
 #include <uringpp/file.h>
@@ -425,7 +426,6 @@ task<void> handle_rpc(uringpp::socket conn, size_t conn_id) {
       }
     } break;
     case method::add: {
-      co_await rpc_reply_empty(conn, req_id);
       uint32_t key_size = *reinterpret_cast<uint32_t *>(req_p);
       req_p += sizeof(key_size);
       std::string_view key(req_p, key_size);
@@ -434,7 +434,12 @@ task<void> handle_rpc(uringpp::socket conn, size_t conn_id) {
       req_p += sizeof(value_size);
       std::string_view value(req_p, value_size);
       req_p += value_size;
-      store->add(key, value);
+      bool success = store->add(key, value);
+      if (!success) {
+        co_await rpc_reply_simple(conn, req_id, (char *)&value[0], 0);
+      } else {
+        co_await rpc_reply_empty(conn, req_id);
+      }
     } break;
     case method::del: {
       auto t = rpc_reply_empty(conn, req_id);
@@ -495,7 +500,6 @@ task<void> handle_rpc(uringpp::socket conn, size_t conn_id) {
       co_await t;
     } break;
     case method::zadd: {
-      auto t = rpc_reply_empty(conn, req_id);
       uint32_t key_size = *reinterpret_cast<uint32_t *>(req_p);
       req_p += sizeof(key_size);
       std::string_view key(req_p, key_size);
@@ -506,8 +510,12 @@ task<void> handle_rpc(uringpp::socket conn, size_t conn_id) {
       req_p += value_size;
       uint32_t score = *reinterpret_cast<uint32_t *>(req_p);
       req_p += sizeof(score);
-      store->zadd(key, value, score);
-      co_await t;
+      bool success = store->zadd(key, value, score);
+      if (!success) {
+        co_await rpc_reply_simple(conn, req_id, (char *)&value[0], 0);
+      } else {
+        co_await rpc_reply_empty(conn, req_id);
+      }
     } break;
     case method::zrmv: {
       auto t = rpc_reply_empty(conn, req_id);
@@ -645,7 +653,7 @@ remote_query(conn_pool &pool, std::string_view key) {
                            std::string_view(p, value_size));
 }
 
-task<void> remote_add(conn_pool &pool, std::string_view key,
+task<bool> remote_add(conn_pool &pool, std::string_view key,
                       std::string_view value) {
   auto body_size = key.size() + value.size() + sizeof(uint32_t) * 2;
   auto body = std::vector<char>(body_size);
@@ -657,7 +665,9 @@ task<void> remote_add(conn_pool &pool, std::string_view key,
   *reinterpret_cast<uint32_t *>(body_p) = value.size();
   body_p += sizeof(uint32_t);
   std::copy_n(value.data(), value.size(), body_p);
-  co_await rpc_call(pool, method::add, std::move(body));
+  auto response = co_await rpc_call(pool, method::add, std::move(body));
+  bool success = response.empty();
+  co_return success;
 }
 
 task<void> evict_remote_key(size_t conn_shard) {
@@ -673,8 +683,8 @@ task<void> evict_remote_key(size_t conn_shard) {
   remote_cache_index.erase(key);
 }
 
-task<void> insert_remote_cache(size_t conn_shard, std::string_view key,
-                               std::string_view value) {
+task<void> insert_remote_cache(size_t conn_shard, std::string key,
+                               std::string value) {
   auto it = remote_cache_index.find(key);
   if (it != remote_cache_index.end()) {
     it->second->value = value;
@@ -683,9 +693,11 @@ task<void> insert_remote_cache(size_t conn_shard, std::string_view key,
   if (remote_cache.size() >= 1024 * 1024) {
     co_await evict_remote_key(conn_shard);
   }
-  remote_cache.emplace_back(
-      cached_value{std::string(key), std::string(value), false});
-  remote_cache_index.emplace(std::string(key), std::prev(remote_cache.end()));
+  auto cv = cached_value{};
+  cv.key = key;
+  cv.value = std::move(value);
+  remote_cache.emplace_back(std::move(cv));
+  remote_cache_index.emplace(std::move(key), std::prev(remote_cache.end()));
 }
 
 task<void> remote_del(conn_pool &pool, std::string_view key) {
@@ -698,25 +710,26 @@ task<void> remote_del(conn_pool &pool, std::string_view key) {
   co_await rpc_call(pool, method::del, std::move(body));
 }
 
-task<void> remote_batch(conn_pool &pool,
-                        std::vector<key_value_view> const &kvs) {
+task<void> remote_batch(
+    conn_pool &pool,
+    std::unordered_map<std::string_view, std::string_view> const &kvs) {
   auto body_size = sizeof(uint32_t);
   for (auto const kv : kvs) {
-    body_size += sizeof(uint32_t) * 2 + kv.key.size() + kv.value.size();
+    body_size += sizeof(uint32_t) * 2 + kv.first.size() + kv.second.size();
   }
   auto body = std::vector<char>(body_size);
   auto body_p = &body[0];
   *reinterpret_cast<uint32_t *>(body_p) = kvs.size();
   body_p += sizeof(uint32_t);
   for (auto const kv : kvs) {
-    *reinterpret_cast<uint32_t *>(body_p) = kv.key.size();
+    *reinterpret_cast<uint32_t *>(body_p) = kv.first.size();
     body_p += sizeof(uint32_t);
-    std::copy_n(kv.key.data(), kv.key.size(), body_p);
-    body_p += kv.key.size();
-    *reinterpret_cast<uint32_t *>(body_p) = kv.value.size();
+    std::copy_n(kv.first.data(), kv.first.size(), body_p);
+    body_p += kv.first.size();
+    *reinterpret_cast<uint32_t *>(body_p) = kv.second.size();
     body_p += sizeof(uint32_t);
-    std::copy_n(kv.value.data(), kv.value.size(), body_p);
-    body_p += kv.value.size();
+    std::copy_n(kv.second.data(), kv.second.size(), body_p);
+    body_p += kv.second.size();
   }
   co_await rpc_call(pool, method::batch, std::move(body));
 }
@@ -756,7 +769,7 @@ remote_list(conn_pool &pool, std::unordered_set<std::string_view> const &keys) {
   co_return {std::move(response), std::move(kvs)};
 }
 
-task<void> remote_zadd(conn_pool &pool, std::string_view key,
+task<bool> remote_zadd(conn_pool &pool, std::string_view key,
                        std::string_view value, uint32_t score) {
   auto body_size = key.size() + value.size() + sizeof(uint32_t) * 3;
   auto body = std::vector<char>(body_size);
@@ -770,7 +783,9 @@ task<void> remote_zadd(conn_pool &pool, std::string_view key,
   std::copy_n(value.data(), value.size(), body_p);
   body_p += value.size();
   *reinterpret_cast<uint32_t *>(body_p) = score;
-  co_await rpc_call(pool, method::zadd, std::move(body));
+  auto response = co_await rpc_call(pool, method::zadd, std::move(body));
+  bool success = response.empty();
+  co_return success;
 }
 
 task<std::optional<std::pair<std::vector<char>, std::vector<score_value_view>>>>
@@ -911,7 +926,7 @@ task<void> rpc_server(std::shared_ptr<loop_with_queue> loop, std::string port) {
 template <class It>
 task<void> send_score_values(uringpp::socket &conn, size_t count, It begin,
                              It end) {
-  if (count < 256) {
+  if (count < 512) {
     // zrange
     rapidjson::StringBuffer buffer;
     auto d = rapidjson::Document();
@@ -1073,16 +1088,24 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
             if (!value.has_value()) {
               co_await send_all(conn, HTTP_404, sizeof(HTTP_404) - 1);
             } else {
-              co_await send_all(conn, value->data(), value->size());
+              co_await send_text(conn, value->data(), value->size());
             }
           } else {
-            auto value =
-                co_await remote_query(rpc_clients[key_shard][conn_shard], key);
-            if (!value.has_value()) {
-              co_await send_all(conn, HTTP_404, sizeof(HTTP_404) - 1);
+            auto it = remote_cache_index.find(key);
+            if (it != remote_cache_index.end()) {
+              auto &value_it = it->second;
+              co_await send_text(conn, value_it->value.data(),
+                                 value_it->value.size());
             } else {
-              co_await send_all(conn, value->second.data(),
-                                value->second.size());
+              auto value = co_await remote_query(
+                  rpc_clients[key_shard][conn_shard], key);
+              if (!value.has_value()) {
+                co_await send_all(conn, HTTP_404, sizeof(HTTP_404) - 1);
+              } else {
+                co_await send_text(conn,
+                                   const_cast<char *>(value->second.data()),
+                                   value->second.size());
+              }
             }
           }
         } break;
@@ -1164,12 +1187,18 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
           auto const key = doc["key"].get_string().take_value();
           auto const value = doc["value"].get_string().take_value();
           auto key_shard = get_shard(key);
+          bool success = false;
           if (key_shard == me) {
-            store->add(key, value);
+            success = store->add(key, value);
           } else {
-            co_await remote_add(rpc_clients[key_shard][conn_shard], key, value);
+            success = co_await remote_add(rpc_clients[key_shard][conn_shard],
+                                          key, value);
           }
-          co_await send_all(conn, EMPTY_RESPONSE, sizeof(EMPTY_RESPONSE) - 1);
+          if (success) {
+            co_await send_all(conn, EMPTY_RESPONSE, sizeof(EMPTY_RESPONSE) - 1);
+          } else {
+            co_await send_all(conn, HTTP_400, sizeof(HTTP_400) - 1);
+          }
         } break;
         case 'b': {
           // batch
@@ -1178,7 +1207,8 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
                                                        request.read_idx());
           auto doc = parser.parse(json);
           auto arr = doc.get_array().take_value();
-          std::vector<std::vector<key_value_view>> sharded_keys(nr_peers);
+          std::vector<std::unordered_map<std::string_view, std::string_view>>
+              sharded_keys(nr_peers);
           auto batch = store->start_batch();
           for (auto &&kv : arr) {
             auto const key = kv["key"].get_string().take_value();
@@ -1187,7 +1217,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
             if (key_shard == me) {
               store->add_batch(batch, key, value);
             } else {
-              sharded_keys[key_shard].emplace_back(key, value);
+              sharded_keys[key_shard][key] = value;
             }
           }
           std::vector<task<void>> tasks;
@@ -1199,7 +1229,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
                                             sharded_keys[key_shard]));
           }
           store->commit_batch(batch);
-          for (auto &&task : tasks) {
+          for (auto &task : tasks) {
             co_await task;
           }
           co_await send_all(conn, EMPTY_RESPONSE, sizeof(EMPTY_RESPONSE) - 1);
@@ -1246,7 +1276,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
           if (local_key_values.empty() && remote_kv_count == 0) {
             co_await send_all(conn, HTTP_404, sizeof(HTTP_404) - 1);
           } else {
-            if (local_key_values.size() + remote_kv_count < 256) {
+            if (local_key_values.size() + remote_kv_count < 512) {
               rapidjson::StringBuffer buffer;
               {
                 auto d = rapidjson::Document();
@@ -1333,13 +1363,19 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
             auto value = score_value["value"].get_string().take_value();
             auto score = score_value["score"].get_uint64().take_value();
             auto key_shard = get_shard(key);
+            bool success = false;
             if (key_shard == me) {
-              store->zadd(key, value, score);
+              success = store->zadd(key, value, score);
             } else {
-              co_await remote_zadd(rpc_clients[key_shard][conn_shard], key,
-                                   value, score);
+              success = co_await remote_zadd(rpc_clients[key_shard][conn_shard],
+                                             key, value, score);
             }
-            co_await send_all(conn, EMPTY_RESPONSE, sizeof(EMPTY_RESPONSE) - 1);
+            if (!success) {
+              co_await send_all(conn, HTTP_400, sizeof(HTTP_400) - 1);
+            } else {
+              co_await send_all(conn, EMPTY_RESPONSE,
+                                sizeof(EMPTY_RESPONSE) - 1);
+            }
           } break;
           case 'r': {
             // zrange

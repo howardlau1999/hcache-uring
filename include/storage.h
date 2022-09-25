@@ -235,12 +235,12 @@ public:
   void commit_batch(rocksdb::WriteBatch *batch);
   void add_batch(rocksdb::WriteBatch *batch, std::string_view key,
                  std::string_view value);
-  void add_no_persist(std::string_view key, std::string_view value);
-  void add(std::string_view key, std::string_view value);
+  bool add_no_persist(std::string_view key, std::string_view value);
+  bool add(std::string_view key, std::string_view value);
   void del(std::string_view key);
-  void zadd_no_persist(std::string_view key, std::string_view value,
+  bool zadd_no_persist(std::string_view key, std::string_view value,
                        uint32_t score);
-  void zadd(std::string_view key, std::string_view value, uint32_t score);
+  bool zadd(std::string_view key, std::string_view value, uint32_t score);
 
   void zrmv(std::string_view key, std::string_view value);
 
