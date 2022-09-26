@@ -14,6 +14,7 @@ enum method : uint8_t {
   ccache,
   cevict,
   cupdate,
+  crmv,
 };
 
 struct key_value {
