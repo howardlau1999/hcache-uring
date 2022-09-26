@@ -1037,7 +1037,7 @@ task<void> send_score_values(uringpp::socket &conn, size_t count, It begin,
       sv_object.AddMember("score", score, allocator);
       auto &buffer = buffers[batch_idx];
       buffer.Clear();
-      if (is_first) {
+      if (is_first) [[unlikely]] {
         is_first = false;
       } else {
         buffer.Put(',');
@@ -1134,7 +1134,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
         assert(request.writable() > 0);
         n = co_await conn.recv(request.write_data(), request.writable(),
                                MSG_NOSIGNAL);
-        if (n <= 0) {
+        if (n <= 0) [[unlikely]] {
           co_return;
         }
         request.advance_write(n);
