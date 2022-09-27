@@ -60,7 +60,7 @@ struct send_conn_state {
 task<void> rpc_reply_recv_loop(uringpp::socket &rpc_conn);
 
 struct conn_pool {
-  static constexpr size_t kMaxConns = 2048;
+  static constexpr size_t kMaxConns = 256;
   std::shared_ptr<loop_with_queue> loop;
   std::queue<std::coroutine_handle<>> waiters;
   std::string host;
@@ -403,13 +403,15 @@ task<void> handle_rpc(uringpp::socket conn, size_t conn_id) {
     }
     auto req_p = request.read_data();
     auto [decompressed, decompressed_size] = [&]() {
-      if (m != method::batch && m != method::list) {
-        return std::make_pair(std::vector<char>(), req_size);
+      if (m == method::batch || m == method::list || m == method::ccache ||
+          m == method::cevict || m == method::cupdate) {
+        std::vector<char> decompressed(req_size);
+        uint32_t decompressed_size =
+            ZSTD_decompress(decompressed.data(), req_size, request.read_data(),
+                            compressed_size);
+        return std::make_pair(std::move(decompressed), decompressed_size);
       }
-      std::vector<char> decompressed(req_size);
-      uint32_t decompressed_size = ZSTD_decompress(
-          decompressed.data(), req_size, request.read_data(), compressed_size);
-      return std::make_pair(std::move(decompressed), decompressed_size);
+      return std::make_pair(std::vector<char>(), req_size);
     }();
     if (!decompressed.empty()) {
       req_p = decompressed.data();
@@ -674,9 +676,11 @@ task<std::vector<char>> send_rpc_request(conn_pool &pool,
     if (m != method::list && m != method::batch) {
       return std::make_pair(std::vector<char>(), req_size);
     }
-    std::vector<char> compressed(m == method::batch || m == method::list
-                                     ? ZSTD_compressBound(body.size())
-                                     : 0);
+    std::vector<char> compressed(
+        m == method::batch || m == method::list || m == method::ccache ||
+                m == method::cevict || m == method::cupdate
+            ? ZSTD_compressBound(body.size())
+            : 0);
     uint32_t compressed_len = ZSTD_compress(&compressed[0], compressed.size(),
                                             &body[0], body.size(), 1);
     if (ZSTD_isError(compressed_len)) {
@@ -935,7 +939,8 @@ task<void> broadcast_key_update(size_t conn_shard, std::vector<key_value> kvs) {
     if (i == me) {
       continue;
     }
-    co_await remote_cache_update(rpc_clients[i][conn_shard], announce_update_kvs[i]);
+    co_await remote_cache_update(rpc_clients[i][conn_shard],
+                                 announce_update_kvs[i]);
   }
 }
 
@@ -949,13 +954,8 @@ task<void> remote_del(conn_pool &pool, std::string_view key) {
   co_await rpc_call(pool, method::del, std::move(body));
 }
 
-task<void> broadcast_key_remove(size_t key_shard, size_t conn_shard,
-                                std::string key) {
-  if (key_shard != me) {
-    co_await remote_del(rpc_clients[key_shard][conn_shard], key);
-  } else {
-    store->del(key);
-  }
+void broadcast_key_remove(size_t key_shard, size_t conn_shard,
+                          std::string key) {
   std::unique_lock lock(remote_cache_mutex);
   auto it = remote_cache_index.find(key);
   if (it != remote_cache_index.end()) {
@@ -1374,7 +1374,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
                                    value->second.size());
                 std::vector<key_value> kvs;
                 kvs.emplace_back(key, value->second);
-                co_await insert_remote_cache(conn_shard, std::move(kvs));
+                insert_remote_cache(conn_shard, std::move(kvs)).detach();
               }
             }
           }
@@ -1384,8 +1384,12 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
           std::string_view key(path + 5, path_len - 5);
           auto key_shard = get_shard(key);
           co_await send_all(conn, EMPTY_RESPONSE, sizeof(EMPTY_RESPONSE) - 1);
-          co_await broadcast_key_remove(key_shard, conn_shard,
-                                        std::string(key));
+          if (key_shard != me) {
+            co_await remote_del(rpc_clients[key_shard][conn_shard], key);
+          } else {
+            store->del(key);
+          }
+          broadcast_key_remove(key_shard, conn_shard, std::string(key));
         } break;
         case 'z': {
           // zrmv
@@ -1462,7 +1466,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
           co_await send_all(conn, EMPTY_RESPONSE, sizeof(EMPTY_RESPONSE) - 1);
           std::vector<key_value> kvs;
           kvs.emplace_back(key, value);
-          co_await broadcast_key_update(conn_shard, std::move(kvs));
+          broadcast_key_update(conn_shard, std::move(kvs)).detach();
         } break;
         case 'b': {
           // batch
@@ -1501,7 +1505,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
                                       std::move(kv2.second));
             }
           }
-          co_await broadcast_key_update(conn_shard, std::move(remote_kvs));
+          broadcast_key_update(conn_shard, std::move(remote_kvs)).detach();
           for (auto &task : tasks) {
             co_await task;
           }
@@ -1603,7 +1607,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
                 for (auto const kv : remote_kvs) {
                   copied.emplace_back(kv.key, kv.value);
                 }
-                co_await broadcast_key_update(conn_shard, std::move(copied));
+                broadcast_key_update(conn_shard, std::move(copied)).detach();
               }
             } else {
               co_await send_all(conn, CHUNK_RESPONSE,
@@ -1652,7 +1656,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
                 for (auto const kv : remote_kvs) {
                   copied.emplace_back(kv.key, kv.value);
                 }
-                co_await broadcast_key_update(conn_shard, std::move(copied));
+                broadcast_key_update(conn_shard, std::move(copied)).detach();
               }
             }
           }
