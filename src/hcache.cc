@@ -1469,8 +1469,7 @@ void db_flusher() {
 }
 
 int main(int argc, char *argv[]) {
-  main_loop = loop_with_queue::create(
-      4096, IORING_SETUP_SQPOLL | IORING_SETUP_SQ_AFF, -1, 0, 1000);
+  main_loop = loop_with_queue::create(4096);
   main_loop->waker().detach();
   ::signal(SIGPIPE, SIG_IGN);
   cores = get_cpu_affinity();
@@ -1491,8 +1490,8 @@ int main(int argc, char *argv[]) {
     auto thread = std::thread([i, core = cores[i]] {
       fmt::print("thread {} bind to core {}\n", i, core);
       bind_cpu(core);
-      auto loop = loop_with_queue::create(
-          4096, IORING_SETUP_ATTACH_WQ | IORING_SETUP_SQPOLL, main_loop->fd());
+      auto loop = loop_with_queue::create(4096, IORING_SETUP_ATTACH_WQ,
+                                          main_loop->fd());
       loops[i] = loop;
       rpc_loops[i] = loop;
       loop_started.fetch_add(1);
