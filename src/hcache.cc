@@ -50,10 +50,6 @@ struct cached_value {
   bool dirty = false;
 };
 
-std::list<cached_value> remote_cache;
-std::shared_mutex remote_cache_mutex;
-unordered_string_map<std::list<cached_value>::iterator> remote_cache_index;
-
 struct send_conn_state {
   std::unique_ptr<uringpp::socket> conn;
 };
@@ -670,36 +666,6 @@ task<bool> remote_add(conn_pool &pool, std::string_view key,
   co_return success;
 }
 
-task<void> evict_remote_key(size_t conn_shard) {
-  auto it = remote_cache.begin();
-  auto &key = it->key;
-  auto &value = it->value;
-  if (it->dirty) {
-    auto key_shard = get_shard(key);
-    auto &pool = rpc_clients[conn_shard][key_shard];
-    co_await remote_add(pool, key, value);
-  }
-  remote_cache.erase(it);
-  remote_cache_index.erase(key);
-}
-
-task<void> insert_remote_cache(size_t conn_shard, std::string key,
-                               std::string value) {
-  auto it = remote_cache_index.find(key);
-  if (it != remote_cache_index.end()) {
-    it->second->value = value;
-    co_return;
-  }
-  if (remote_cache.size() >= 1024 * 1024) {
-    co_await evict_remote_key(conn_shard);
-  }
-  auto cv = cached_value{};
-  cv.key = key;
-  cv.value = std::move(value);
-  remote_cache.emplace_back(std::move(cv));
-  remote_cache_index.emplace(std::move(key), std::prev(remote_cache.end()));
-}
-
 task<void> remote_del(conn_pool &pool, std::string_view key) {
   auto body_size = key.size() + sizeof(uint32_t);
   auto body = std::vector<char>(body_size);
@@ -926,7 +892,7 @@ task<void> rpc_server(std::shared_ptr<loop_with_queue> loop, std::string port) {
 template <class It>
 task<void> send_score_values(uringpp::socket &conn, size_t count, It begin,
                              It end) {
-  if (count < 512) {
+  if (count < 1000000) {
     // zrange
     rapidjson::StringBuffer buffer;
     auto d = rapidjson::Document();
@@ -1091,21 +1057,13 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
               co_await send_text(conn, value->data(), value->size());
             }
           } else {
-            auto it = remote_cache_index.find(key);
-            if (it != remote_cache_index.end()) {
-              auto &value_it = it->second;
-              co_await send_text(conn, value_it->value.data(),
-                                 value_it->value.size());
+            auto value =
+                co_await remote_query(rpc_clients[key_shard][conn_shard], key);
+            if (!value.has_value()) {
+              co_await send_all(conn, HTTP_404, sizeof(HTTP_404) - 1);
             } else {
-              auto value = co_await remote_query(
-                  rpc_clients[key_shard][conn_shard], key);
-              if (!value.has_value()) {
-                co_await send_all(conn, HTTP_404, sizeof(HTTP_404) - 1);
-              } else {
-                co_await send_text(conn,
-                                   const_cast<char *>(value->second.data()),
-                                   value->second.size());
-              }
+              co_await send_text(conn, (char *)value->second.data(),
+                                 value->second.size());
             }
           }
         } break;
@@ -1132,13 +1090,9 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
           auto const key = std::string_view(path + 6, slash_ptr - 1);
           auto const value = std::string_view(slash_ptr, end_ptr - slash_ptr);
           auto key_shard = get_shard(key);
-          if (key_shard == me) {
-            store->zrmv(key, value);
-          } else {
-            co_await remote_zrmv(rpc_clients[key_shard][conn_shard], key,
-                                 value);
-          }
+          store->zrmv(key, value);
           co_await send_all(conn, EMPTY_RESPONSE, sizeof(EMPTY_RESPONSE) - 1);
+          co_await remote_zrmv(rpc_clients[key_shard][conn_shard], key, value);
         } break;
         }
       } break;
@@ -1276,7 +1230,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
           if (local_key_values.empty() && remote_kv_count == 0) {
             co_await send_all(conn, HTTP_404, sizeof(HTTP_404) - 1);
           } else {
-            if (local_key_values.size() + remote_kv_count < 512) {
+            if (local_key_values.size() + remote_kv_count < 10000000) {
               rapidjson::StringBuffer buffer;
               {
                 auto d = rapidjson::Document();
@@ -1363,19 +1317,10 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
             auto value = score_value["value"].get_string().take_value();
             auto score = score_value["score"].get_uint64().take_value();
             auto key_shard = get_shard(key);
-            bool success = false;
-            if (key_shard == me) {
-              success = store->zadd(key, value, score);
-            } else {
-              success = co_await remote_zadd(rpc_clients[key_shard][conn_shard],
-                                             key, value, score);
-            }
-            if (!success) {
-              co_await send_all(conn, HTTP_400, sizeof(HTTP_400) - 1);
-            } else {
-              co_await send_all(conn, EMPTY_RESPONSE,
-                                sizeof(EMPTY_RESPONSE) - 1);
-            }
+            store->zadd(key, value, score);
+            co_await send_all(conn, EMPTY_RESPONSE, sizeof(EMPTY_RESPONSE) - 1);
+            co_await remote_zadd(rpc_clients[key_shard][conn_shard], key, value,
+                                 score);
           } break;
           case 'r': {
             // zrange
@@ -1387,7 +1332,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
             auto min_score = score_range["min_score"].get_uint64().take_value();
             auto max_score = score_range["max_score"].get_uint64().take_value();
             auto key_shard = get_shard(key);
-            if (key_shard == me) {
+            if (true) {
               auto score_values = store->zrange(key, min_score, max_score);
               if (!score_values.has_value()) {
                 co_await send_all(conn, HTTP_404, sizeof(HTTP_404) - 1);
@@ -1396,7 +1341,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
                                            score_values->begin(),
                                            score_values->end());
               }
-            } else {
+            } else if (false) {
               auto score_values =
                   co_await remote_zrange(rpc_clients[key_shard][conn_shard],
                                          key, min_score, max_score);
