@@ -506,12 +506,8 @@ task<void> handle_rpc(uringpp::socket conn, size_t conn_id) {
       req_p += value_size;
       uint32_t score = *reinterpret_cast<uint32_t *>(req_p);
       req_p += sizeof(score);
-      bool success = store->zadd(key, value, score);
-      if (!success) {
-        co_await rpc_reply_simple(conn, req_id, (char *)&value[0], 0);
-      } else {
-        co_await rpc_reply_empty(conn, req_id);
-      }
+      store->zadd(key, value, score);
+      co_await rpc_reply_empty(conn, req_id);
     } break;
     case method::zrmv: {
       auto t = rpc_reply_empty(conn, req_id);
@@ -1092,7 +1088,17 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
           auto key_shard = get_shard(key);
           store->zrmv(key, value);
           co_await send_all(conn, EMPTY_RESPONSE, sizeof(EMPTY_RESPONSE) - 1);
-          co_await remote_zrmv(rpc_clients[key_shard][conn_shard], key, value);
+          std::vector<task<void>> tasks;
+          for (size_t i = 0; i < nr_peers; ++i) {
+            if (i == me) {
+              continue;
+            }
+            tasks.emplace_back(
+                remote_zrmv(rpc_clients[i][conn_shard], key, value));
+          }
+          for (auto &t : tasks) {
+            co_await t;
+          }
         } break;
         }
       } break;
@@ -1319,8 +1325,17 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
             auto key_shard = get_shard(key);
             store->zadd(key, value, score);
             co_await send_all(conn, EMPTY_RESPONSE, sizeof(EMPTY_RESPONSE) - 1);
-            co_await remote_zadd(rpc_clients[key_shard][conn_shard], key, value,
-                                 score);
+            std::vector<task<bool>> tasks;
+            for (size_t i = 0; i < nr_peers; i++) {
+              if (i == me) {
+                continue;
+              }
+              tasks.emplace_back(
+                  remote_zadd(rpc_clients[i][conn_shard], key, value, score));
+            }
+            for (auto &t : tasks) {
+              co_await t;
+            }
           } break;
           case 'r': {
             // zrange
