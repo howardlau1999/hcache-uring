@@ -6,6 +6,7 @@
 #include "uringpp/task.h"
 #include "xxhash.h"
 #include <algorithm>
+#include <ankerl/unordered_dense.h>
 #include <boost/multi_index/hashed_index.hpp>
 #include <boost/multi_index/member.hpp>
 #include <boost/multi_index_container.hpp>
@@ -29,6 +30,28 @@
 #include <vector>
 
 using namespace boost::multi_index;
+
+struct string_hash {
+  using is_transparent = void; // enable heterogenous lookup
+  using is_avalanching = void; // mark class as high quality avalanching hash
+
+  [[nodiscard]] auto operator()(const char *str) const noexcept -> uint64_t {
+    return ankerl::unordered_dense::hash<std::string_view>{}(str);
+  }
+
+  [[nodiscard]] auto operator()(std::string_view str) const noexcept
+      -> uint64_t {
+    return ankerl::unordered_dense::hash<std::string_view>{}(str);
+  }
+
+  [[nodiscard]] auto operator()(std::string const &str) const noexcept
+      -> uint64_t {
+    return ankerl::unordered_dense::hash<std::string_view>{}(str);
+  }
+};
+
+using ankerlkv = ankerl::unordered_dense::map<std::string, std::string, string_hash, std::equal_to<>>;
+
 
 template <typename T, typename Q> struct mutable_pair {
   T first;
@@ -186,7 +209,7 @@ class storage {
   std::atomic<bool> kv_initialized_;
   rocksdb::WriteOptions write_options_;
 
-  unordered_string_map<std::string> kvs_[nr_shards];
+  ankerlkv kvs_[nr_shards];
   std::shared_mutex kvs_mutex_[nr_shards];
   unordered_string_map<std::unique_ptr<zset_stl>> zsets_[nr_shards];
   std::shared_mutex zsets_mutex_[nr_shards];

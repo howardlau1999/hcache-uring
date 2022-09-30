@@ -56,10 +56,12 @@ add_subdirectory(third_party/uringpp)
 add_subdirectory(third_party/fmt)
 add_subdirectory(third_party/mimalloc)
 add_subdirectory(third_party/simdjson)
+add_subdirectory(third_party/unordered_dense)
 set(BUILD_EXAMPLES OFF)
 set(BUILD_TESTING OFF)
 include_directories(third_party/rapidjson/include)
 include_directories(third_party/uringpp/include)
+include_directories(third_party/unordered_dense/include)
 include_directories(include)
 
 add_library(hcache-common src/storage.cc src/threading.cc src/picohttpparser.c)
@@ -78,6 +80,7 @@ target_link_libraries(hcache-common
     simdjson
     uringpp
     xxhash
+    unordered_dense
 )
 
 add_executable(hcache src/hcache.cc)

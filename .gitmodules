@@ -22,3 +22,6 @@
 [submodule "third_party/f-stack-co"]
 	path = third_party/f-stack-co
 	url = https://github.com/howardlau1999/f-stack-co
+[submodule "third_party/unordered_dense"]
+	path = third_party/unordered_dense
+	url = https://github.com/martinus/unordered_dense
