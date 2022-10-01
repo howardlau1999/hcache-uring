@@ -209,12 +209,12 @@ class storage {
   std::atomic<bool> kv_initialized_;
   rocksdb::WriteOptions write_options_;
 
-  ankerlkv kvs_[nr_shards];
-  std::shared_mutex kvs_mutex_[nr_shards];
-  unordered_string_map<std::unique_ptr<zset_stl>> zsets_[nr_shards];
-  std::shared_mutex zsets_mutex_[nr_shards];
-  // kv_cuckoo_set kvs_;
-  // zset_cuckoo_set zsets_;
+  // ankerlkv kvs_[nr_shards];
+  // std::shared_mutex kvs_mutex_[nr_shards];
+  // unordered_string_map<std::unique_ptr<zset_stl>> zsets_[nr_shards];
+  // std::shared_mutex zsets_mutex_[nr_shards];
+  kv_cuckoo_set kvs_;
+  zset_cuckoo_set zsets_;
 
   void open_kv_db();
   size_t get_key_shard(std::string_view key) const;
