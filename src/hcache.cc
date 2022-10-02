@@ -856,10 +856,7 @@ task<void> sync_changeset(size_t key_shard, size_t conn_shard) {
         body_p += sizeof(uint32_t);
         std::copy_n(kv.key.data(), kv.key.size(), body_p);
         body_p += kv.key.size();
-        *reinterpret_cast<uint32_t *>(body_p) = kv.value.size();
-        body_p += sizeof(uint32_t);
-        std::copy_n(kv.value.data(), kv.value.size(), body_p);
-        body_p += kv.value.size();
+        *reinterpret_cast<uint32_t *>(body_p) = 0;
       }
       cs.sending.clear();
       co_await rpc_call(pool, method::cbatch, std::move(body));
@@ -870,7 +867,7 @@ task<void> sync_changeset(size_t key_shard, size_t conn_shard) {
 void add_changeset(size_t key_shard, size_t conn_shard, std::string_view key,
                    std::string_view value) {
   auto &cs = changesets[key_shard][conn_shard];
-  cs.pending.emplace_back(key, value);
+  cs.pending.emplace_back(key, std::string());
   if (!cs.syncing) {
     cs.h.resume();
   }
