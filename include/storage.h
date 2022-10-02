@@ -10,6 +10,7 @@
 #include <boost/multi_index/hashed_index.hpp>
 #include <boost/multi_index/member.hpp>
 #include <boost/multi_index_container.hpp>
+#include <cds/container/optimistic_queue.h>
 #include <cds/intrusive/cuckoo_set.h>
 #include <cds/intrusive/michael_list_hp.h>
 #include <cds/intrusive/michael_set.h>
@@ -50,8 +51,8 @@ struct string_hash {
   }
 };
 
-using ankerlkv = ankerl::unordered_dense::map<std::string, std::string, string_hash, std::equal_to<>>;
-
+using ankerlkv = ankerl::unordered_dense::map<std::string, std::string,
+                                              string_hash, std::equal_to<>>;
 
 template <typename T, typename Q> struct mutable_pair {
   T first;
@@ -98,6 +99,11 @@ using unordered_string_set = multi_index_container<
     index_string, indexed_by<hashed_unique<
                       member<index_string, std::string, &index_string::key>,
                       string_view_hash, string_view_equal_to>>>;
+
+typedef cds::container::OptimisticQueue<
+    cds::gc::HP, std::string_view,
+    typename cds::container::optimistic_queue::make_traits<>::type>
+    fifo_queue;
 
 size_t get_shard(std::string_view key);
 extern size_t nr_peers;
@@ -209,12 +215,12 @@ class storage {
   std::atomic<bool> kv_initialized_;
   rocksdb::WriteOptions write_options_;
 
-  // ankerlkv kvs_[nr_shards];
-  // std::shared_mutex kvs_mutex_[nr_shards];
-  // unordered_string_map<std::unique_ptr<zset_stl>> zsets_[nr_shards];
-  // std::shared_mutex zsets_mutex_[nr_shards];
-  kv_cuckoo_set kvs_;
-  zset_cuckoo_set zsets_;
+  ankerlkv kvs_[nr_shards];
+  std::shared_mutex kvs_mutex_[nr_shards];
+  unordered_string_map<std::unique_ptr<zset_stl>> zsets_[nr_shards];
+  std::shared_mutex zsets_mutex_[nr_shards];
+  // kv_cuckoo_set kvs_;
+  // zset_cuckoo_set zsets_;
 
   void open_kv_db();
   size_t get_key_shard(std::string_view key) const;

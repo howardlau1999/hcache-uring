@@ -11,9 +11,9 @@ enum method : uint8_t {
   zadd,
   zrange,
   zrmv,
-  ccache,
-  cevict,
-  cupdate,
+  cadd,
+  cdel,
+  cbatch,
 };
 
 struct key_value {
@@ -32,6 +32,8 @@ struct key_value {
 struct key_view_value {
   std::string_view key;
   std::string value;
+  key_view_value() = default;
+  key_view_value(key_view_value &&) = default;
   key_view_value(std::string_view key, std::string const &value)
       : key(key), value(value) {}
   key_view_value(std::string_view key, std::string &&value)

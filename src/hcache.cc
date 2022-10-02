@@ -1,3 +1,4 @@
+#include "cds/init.h"
 #include "io_buffer.h"
 #include "rapidjson/stringbuffer.h"
 #include "rpc.h"
@@ -43,13 +44,6 @@
 
 using uringpp::task;
 
-struct cached_value {
-  std::string key;
-  std::string value;
-  std::bitset<32> cached_peers;
-  bool dirty = false;
-};
-
 struct send_conn_state {
   std::unique_ptr<uringpp::socket> conn;
 };
@@ -57,7 +51,7 @@ struct send_conn_state {
 task<void> rpc_reply_recv_loop(uringpp::socket &rpc_conn);
 
 struct conn_pool {
-  static constexpr size_t kMaxConns = 2048;
+  static constexpr size_t kMaxConns = 256;
   std::shared_ptr<loop_with_queue> loop;
   std::queue<std::coroutine_handle<>> waiters;
   std::string host;
@@ -77,7 +71,9 @@ struct conn_pool {
       return conn;
     }
   };
+  
   task<send_conn_state *> new_conn() {
+
     auto rpc_conn = co_await uringpp::socket::connect(loop, host, port);
     {
       int flags = 1;
@@ -90,6 +86,7 @@ struct conn_pool {
     rpc_reply_recv_loop(*state->conn).detach();
     co_return state;
   }
+
   task<send_conn_state *> get_conn() {
     if (conns.empty()) {
       if (nr_conns < kMaxConns) {
@@ -124,12 +121,15 @@ std::vector<std::string> peer_hosts;
 std::atomic<bool> peers_updated = false;
 std::atomic<bool> rpc_connected = false;
 std::vector<int> cores;
-size_t nr_peers = 0;
+size_t nr_peers = 1;
 size_t me = 0;
 
+kv_cuckoo_set remote_cache;
+fifo_queue evict_queue;
+std::atomic<size_t> cached_count = 0;
+constexpr size_t kMaxCacheCount = 1024 * 1024 * 4;
+
 size_t get_shard(std::string_view key) {
-  if (nr_peers == 0)
-    return 0;
   auto hash = XXH64(key.data(), key.size(), 19260817);
   return hash % nr_peers;
 }
@@ -349,6 +349,50 @@ uringpp::task<void> rpc_reply(uringpp::socket &conn, uint64_t req_id,
 
 constexpr size_t kRPCRequestHeaderSize =
     sizeof(uint64_t) + sizeof(method) + sizeof(uint32_t) + sizeof(uint32_t);
+bool remove_cache_entry(std::string_view key) {
+  if (auto p = remote_cache.erase(key); p) {
+    mi_disposer<key_value_intl>()(p);
+    cached_count.fetch_sub(1, std::memory_order_relaxed);
+    return true;
+  }
+  return false;
+}
+
+void evict_cache() {
+  while (!evict_queue.empty()) {
+    std::string_view key;
+    evict_queue.pop(key);
+    remove_cache_entry(key);
+  }
+}
+
+bool update_cache(std::string_view key, std::string_view value) {
+  return remote_cache.find(key, [value](auto &kv, ...) {
+    kv.value.assign(value.begin(), value.end());
+  });
+}
+
+void insert_cache(std::string_view key, std::string_view value) {
+  if (update_cache(key, value)) {
+    return;
+  }
+  key_value_intl *kv = new key_value_intl(key, value);
+  auto [success, is_new] =
+      remote_cache.update(*kv, [](bool inserted, auto &old_kv, auto &new_kv) {
+        if (!inserted) {
+          old_kv.value = new_kv.value;
+        }
+      });
+  if (!is_new) {
+    mi_disposer<key_value_intl>()(kv);
+  } else {
+    evict_queue.enqueue(kv->key);
+    if (cached_count.fetch_add(1, std::memory_order_relaxed) >=
+        kMaxCacheCount) {
+      evict_cache();
+    }
+  }
+}
 
 task<void> handle_rpc(uringpp::socket conn, size_t conn_id) {
   auto loop = rpc_loops[(conn_id % (rpc_loops.size() - 1)) + 1];
@@ -359,130 +403,71 @@ task<void> handle_rpc(uringpp::socket conn, size_t conn_id) {
   uint32_t req_size = 0;
   uint32_t compressed_size = 0;
   method m = method::query;
-  while (true) {
-    if (state == kStateRecvHeader) {
-      if (request.readable() >= kRPCRequestHeaderSize) {
-        auto p = request.read_data();
-        req_id = *reinterpret_cast<uint64_t *>(p);
-        p += sizeof(req_id);
-        m = *reinterpret_cast<method *>(p);
-        p += sizeof(m);
-        req_size = *reinterpret_cast<uint32_t *>(p);
-        p += sizeof(req_size);
-        compressed_size = *reinterpret_cast<uint32_t *>(p);
-        p += sizeof(compressed_size);
-        request.advance_read(kRPCRequestHeaderSize);
-        state = kStateRecvBody;
-        if (compressed_size > request.writable()) {
-          request.expand(compressed_size - request.writable());
+  try {
+    while (true) {
+      if (state == kStateRecvHeader) {
+        if (request.readable() >= kRPCRequestHeaderSize) {
+          auto p = request.read_data();
+          req_id = *reinterpret_cast<uint64_t *>(p);
+          p += sizeof(req_id);
+          m = *reinterpret_cast<method *>(p);
+          p += sizeof(m);
+          req_size = *reinterpret_cast<uint32_t *>(p);
+          p += sizeof(req_size);
+          compressed_size = *reinterpret_cast<uint32_t *>(p);
+          p += sizeof(compressed_size);
+          request.advance_read(kRPCRequestHeaderSize);
+          state = kStateRecvBody;
+          if (compressed_size > request.writable()) {
+            request.expand(compressed_size - request.writable());
+          }
+        } else if (request.writable() < kRPCRequestHeaderSize) {
+          request.expand(kRPCRequestHeaderSize - request.writable());
         }
-      } else if (request.writable() < kRPCRequestHeaderSize) {
-        request.expand(kRPCRequestHeaderSize - request.writable());
       }
-    }
-    if (state == kStateRecvBody) {
-      if (request.readable() >= compressed_size) {
-        state = kStateProcess;
+      if (state == kStateRecvBody) {
+        if (request.readable() >= compressed_size) {
+          state = kStateProcess;
+        }
       }
-    }
-    if (state != kStateProcess) {
-      auto n = co_await conn.recv(request.write_data(), request.writable());
-      if (n <= 0) [[unlikely]] {
-        fmt::print("recv error: {} writable {}\n", n, request.writable());
-        co_return;
+      if (state != kStateProcess) {
+        auto n = co_await conn.recv(request.write_data(), request.writable());
+        if (n <= 0) [[unlikely]] {
+          fmt::print("recv error: {} writable {}\n", n, request.writable());
+          co_return;
+        }
+        request.advance_write(n);
+        continue;
       }
-      request.advance_write(n);
-      continue;
-    }
-    auto req_p = request.read_data();
-    auto [decompressed, decompressed_size] = [&]() {
-      if (m != method::batch && m != method::list) {
-        return std::make_pair(std::vector<char>(), req_size);
+      auto req_p = request.read_data();
+      auto [decompressed, decompressed_size] = [&]() {
+        if (m != method::batch && m != method::list && m != method::cbatch) {
+          return std::make_pair(std::vector<char>(), req_size);
+        }
+        std::vector<char> decompressed(req_size);
+        uint32_t decompressed_size =
+            ZSTD_decompress(decompressed.data(), req_size, request.read_data(),
+                            compressed_size);
+        return std::make_pair(std::move(decompressed), decompressed_size);
+      }();
+      if (!decompressed.empty()) {
+        req_p = decompressed.data();
+        assert(decompressed_size == req_size);
       }
-      std::vector<char> decompressed(req_size);
-      uint32_t decompressed_size = ZSTD_decompress(
-          decompressed.data(), req_size, request.read_data(), compressed_size);
-      return std::make_pair(std::move(decompressed), decompressed_size);
-    }();
-    if (!decompressed.empty()) {
-      req_p = decompressed.data();
-      assert(decompressed_size == req_size);
-    }
-    switch (m) {
-    case method::query: {
-      uint32_t key_size = *reinterpret_cast<uint32_t *>(req_p);
-      req_p += sizeof(key_size);
-      std::string_view key(req_p, key_size);
-      req_p += key_size;
-      auto value = store->query(key);
-      if (value.has_value()) [[likely]] {
-        co_await rpc_reply_simple(conn, req_id, value->data(), value->size());
-      } else {
-        co_await rpc_reply_empty(conn, req_id);
-      }
-    } break;
-    case method::add: {
-      uint32_t key_size = *reinterpret_cast<uint32_t *>(req_p);
-      req_p += sizeof(key_size);
-      std::string_view key(req_p, key_size);
-      req_p += key_size;
-      uint32_t value_size = *reinterpret_cast<uint32_t *>(req_p);
-      req_p += sizeof(value_size);
-      std::string_view value(req_p, value_size);
-      req_p += value_size;
-      bool success = store->add(key, value);
-      if (!success) {
-        co_await rpc_reply_simple(conn, req_id, (char *)&value[0], 0);
-      } else {
-        co_await rpc_reply_empty(conn, req_id);
-      }
-    } break;
-    case method::del: {
-      auto t = rpc_reply_empty(conn, req_id);
-      uint32_t key_size = *reinterpret_cast<uint32_t *>(req_p);
-      req_p += sizeof(key_size);
-      std::string_view key(req_p, key_size);
-      req_p += key_size;
-      store->del(key);
-      co_await t;
-    } break;
-    case method::list: {
-      uint32_t key_count = *reinterpret_cast<uint32_t *>(req_p);
-      req_p += sizeof(key_count);
-      std::vector<std::string_view> keys;
-      for (uint32_t i = 0; i < key_count; i++) {
+      switch (m) {
+      case method::query: {
         uint32_t key_size = *reinterpret_cast<uint32_t *>(req_p);
         req_p += sizeof(key_size);
         std::string_view key(req_p, key_size);
         req_p += key_size;
-        keys.push_back(key);
-      }
-      auto values = store->list(keys.begin(), keys.end());
-      size_t rep_body_size = sizeof(uint32_t);
-      for (auto &v : values) {
-        rep_body_size += sizeof(uint32_t) * 2 + v.key.size() + v.value.size();
-      }
-      auto rep_body = std::vector<char>(rep_body_size);
-      auto p = &rep_body[0];
-      *reinterpret_cast<uint32_t *>(p) = values.size();
-      p += sizeof(uint32_t);
-      for (auto &v : values) {
-        *reinterpret_cast<uint32_t *>(p) = v.key.size();
-        p += sizeof(uint32_t);
-        std::copy_n(v.key.data(), v.key.size(), p);
-        p += v.key.size();
-        *reinterpret_cast<uint32_t *>(p) = v.value.size();
-        p += sizeof(uint32_t);
-        std::copy_n(v.value.data(), v.value.size(), p);
-        p += v.value.size();
-      }
-      co_await rpc_reply(conn, req_id, std::move(rep_body), true);
-    } break;
-    case method::batch: {
-      auto t = rpc_reply_empty(conn, req_id);
-      uint32_t count = *reinterpret_cast<uint32_t *>(req_p);
-      req_p += sizeof(count);
-      for (uint32_t i = 0; i < count; i++) {
+        auto value = store->query(key);
+        if (value.has_value()) [[likely]] {
+          co_await rpc_reply_simple(conn, req_id, value->data(), value->size());
+        } else {
+          co_await rpc_reply_empty(conn, req_id);
+        }
+      } break;
+      case method::add: {
         uint32_t key_size = *reinterpret_cast<uint32_t *>(req_p);
         req_p += sizeof(key_size);
         std::string_view key(req_p, key_size);
@@ -491,78 +476,180 @@ task<void> handle_rpc(uringpp::socket conn, size_t conn_id) {
         req_p += sizeof(value_size);
         std::string_view value(req_p, value_size);
         req_p += value_size;
-        store->add(key, value);
-      }
-      co_await t;
-    } break;
-    case method::zadd: {
-      uint32_t key_size = *reinterpret_cast<uint32_t *>(req_p);
-      req_p += sizeof(key_size);
-      std::string_view key(req_p, key_size);
-      req_p += key_size;
-      uint32_t value_size = *reinterpret_cast<uint32_t *>(req_p);
-      req_p += sizeof(value_size);
-      std::string_view value(req_p, value_size);
-      req_p += value_size;
-      uint32_t score = *reinterpret_cast<uint32_t *>(req_p);
-      req_p += sizeof(score);
-      store->zadd(key, value, score);
-      co_await rpc_reply_empty(conn, req_id);
-    } break;
-    case method::zrmv: {
-      auto t = rpc_reply_empty(conn, req_id);
-      uint32_t key_size = *reinterpret_cast<uint32_t *>(req_p);
-      req_p += sizeof(key_size);
-      std::string_view key(req_p, key_size);
-      req_p += key_size;
-      uint32_t value_size = *reinterpret_cast<uint32_t *>(req_p);
-      req_p += sizeof(value_size);
-      std::string_view value(req_p, value_size);
-      req_p += value_size;
-      store->zrmv(key, value);
-      co_await t;
-    } break;
-    case method::zrange: {
-      uint32_t key_size = *reinterpret_cast<uint32_t *>(req_p);
-      req_p += sizeof(key_size);
-      std::string_view key(req_p, key_size);
-      req_p += key_size;
-      uint32_t min_score = *reinterpret_cast<uint32_t *>(req_p);
-      req_p += sizeof(min_score);
-      uint32_t max_score = *reinterpret_cast<uint32_t *>(req_p);
-      req_p += sizeof(max_score);
-      auto values = store->zrange(key, min_score, max_score);
-      if (!values.has_value()) {
-        co_await rpc_reply(conn, req_id, {});
-      } else {
-        auto const &score_values = values.value();
+        bool success = store->add(key, value);
+        if (!success) {
+          co_await rpc_reply_simple(conn, req_id, (char *)&value[0], 0);
+        } else {
+          co_await rpc_reply_empty(conn, req_id);
+        }
+      } break;
+      case method::cadd: {
+        uint32_t key_size = *reinterpret_cast<uint32_t *>(req_p);
+        req_p += sizeof(key_size);
+        std::string_view key(req_p, key_size);
+        req_p += key_size;
+        uint32_t value_size = *reinterpret_cast<uint32_t *>(req_p);
+        req_p += sizeof(value_size);
+        std::string_view value(req_p, value_size);
+        req_p += value_size;
+        update_cache(key, value);
+        co_await rpc_reply_empty(conn, req_id);
+      } break;
+      case method::del: {
+        auto t = rpc_reply_empty(conn, req_id);
+        uint32_t key_size = *reinterpret_cast<uint32_t *>(req_p);
+        req_p += sizeof(key_size);
+        std::string_view key(req_p, key_size);
+        req_p += key_size;
+        store->del(key);
+        co_await t;
+      } break;
+      case method::cdel: {
+        auto t = rpc_reply_empty(conn, req_id);
+        uint32_t key_size = *reinterpret_cast<uint32_t *>(req_p);
+        req_p += sizeof(key_size);
+        std::string_view key(req_p, key_size);
+        req_p += key_size;
+        remove_cache_entry(key);
+        co_await t;
+      } break;
+      case method::list: {
+        uint32_t key_count = *reinterpret_cast<uint32_t *>(req_p);
+        req_p += sizeof(key_count);
+        std::vector<std::string_view> keys;
+        for (uint32_t i = 0; i < key_count; i++) {
+          uint32_t key_size = *reinterpret_cast<uint32_t *>(req_p);
+          req_p += sizeof(key_size);
+          std::string_view key(req_p, key_size);
+          req_p += key_size;
+          keys.push_back(key);
+        }
+        auto values = store->list(keys.begin(), keys.end());
         size_t rep_body_size = sizeof(uint32_t);
-        for (auto &v : score_values) {
-          rep_body_size += sizeof(uint32_t) * 2 + v.value.size();
+        for (auto &v : values) {
+          rep_body_size += sizeof(uint32_t) * 2 + v.key.size() + v.value.size();
         }
         auto rep_body = std::vector<char>(rep_body_size);
         auto p = &rep_body[0];
-        *reinterpret_cast<uint32_t *>(p) = score_values.size();
+        *reinterpret_cast<uint32_t *>(p) = values.size();
         p += sizeof(uint32_t);
-        for (auto &sv : score_values) {
-          *reinterpret_cast<uint32_t *>(p) = sv.value.size();
+        for (auto &v : values) {
+          *reinterpret_cast<uint32_t *>(p) = v.key.size();
           p += sizeof(uint32_t);
-          std::copy_n(sv.value.data(), sv.value.size(), p);
-          p += sv.value.size();
-          *reinterpret_cast<uint32_t *>(p) = sv.score;
+          std::copy_n(v.key.data(), v.key.size(), p);
+          p += v.key.size();
+          *reinterpret_cast<uint32_t *>(p) = v.value.size();
           p += sizeof(uint32_t);
+          std::copy_n(v.value.data(), v.value.size(), p);
+          p += v.value.size();
         }
         co_await rpc_reply(conn, req_id, std::move(rep_body), true);
+      } break;
+      case method::batch: {
+        auto t = rpc_reply_empty(conn, req_id);
+        uint32_t count = *reinterpret_cast<uint32_t *>(req_p);
+        req_p += sizeof(count);
+        for (uint32_t i = 0; i < count; i++) {
+          uint32_t key_size = *reinterpret_cast<uint32_t *>(req_p);
+          req_p += sizeof(key_size);
+          std::string_view key(req_p, key_size);
+          req_p += key_size;
+          uint32_t value_size = *reinterpret_cast<uint32_t *>(req_p);
+          req_p += sizeof(value_size);
+          std::string_view value(req_p, value_size);
+          req_p += value_size;
+          store->add(key, value);
+        }
+        co_await t;
+      } break;
+      case method::cbatch: {
+        auto t = rpc_reply_empty(conn, req_id);
+        uint32_t count = *reinterpret_cast<uint32_t *>(req_p);
+        req_p += sizeof(count);
+        for (uint32_t i = 0; i < count; i++) {
+          uint32_t key_size = *reinterpret_cast<uint32_t *>(req_p);
+          req_p += sizeof(key_size);
+          std::string_view key(req_p, key_size);
+          req_p += key_size;
+          uint32_t value_size = *reinterpret_cast<uint32_t *>(req_p);
+          req_p += sizeof(value_size);
+          std::string_view value(req_p, value_size);
+          req_p += value_size;
+          update_cache(key, value);
+        }
+        co_await t;
+      } break;
+      case method::zadd: {
+        uint32_t key_size = *reinterpret_cast<uint32_t *>(req_p);
+        req_p += sizeof(key_size);
+        std::string_view key(req_p, key_size);
+        req_p += key_size;
+        uint32_t value_size = *reinterpret_cast<uint32_t *>(req_p);
+        req_p += sizeof(value_size);
+        std::string_view value(req_p, value_size);
+        req_p += value_size;
+        uint32_t score = *reinterpret_cast<uint32_t *>(req_p);
+        req_p += sizeof(score);
+        store->zadd(key, value, score);
+        co_await rpc_reply_empty(conn, req_id);
+      } break;
+      case method::zrmv: {
+        auto t = rpc_reply_empty(conn, req_id);
+        uint32_t key_size = *reinterpret_cast<uint32_t *>(req_p);
+        req_p += sizeof(key_size);
+        std::string_view key(req_p, key_size);
+        req_p += key_size;
+        uint32_t value_size = *reinterpret_cast<uint32_t *>(req_p);
+        req_p += sizeof(value_size);
+        std::string_view value(req_p, value_size);
+        req_p += value_size;
+        store->zrmv(key, value);
+        co_await t;
+      } break;
+      case method::zrange: {
+        uint32_t key_size = *reinterpret_cast<uint32_t *>(req_p);
+        req_p += sizeof(key_size);
+        std::string_view key(req_p, key_size);
+        req_p += key_size;
+        uint32_t min_score = *reinterpret_cast<uint32_t *>(req_p);
+        req_p += sizeof(min_score);
+        uint32_t max_score = *reinterpret_cast<uint32_t *>(req_p);
+        req_p += sizeof(max_score);
+        auto values = store->zrange(key, min_score, max_score);
+        if (!values.has_value()) {
+          co_await rpc_reply(conn, req_id, {});
+        } else {
+          auto const &score_values = values.value();
+          size_t rep_body_size = sizeof(uint32_t);
+          for (auto &v : score_values) {
+            rep_body_size += sizeof(uint32_t) * 2 + v.value.size();
+          }
+          auto rep_body = std::vector<char>(rep_body_size);
+          auto p = &rep_body[0];
+          *reinterpret_cast<uint32_t *>(p) = score_values.size();
+          p += sizeof(uint32_t);
+          for (auto &sv : score_values) {
+            *reinterpret_cast<uint32_t *>(p) = sv.value.size();
+            p += sizeof(uint32_t);
+            std::copy_n(sv.value.data(), sv.value.size(), p);
+            p += sv.value.size();
+            *reinterpret_cast<uint32_t *>(p) = sv.score;
+            p += sizeof(uint32_t);
+          }
+          co_await rpc_reply(conn, req_id, std::move(rep_body), true);
+        }
+      } break;
+      default: {
+        co_await rpc_reply_empty(conn, req_id);
       }
-    } break;
-    default: {
-      co_await rpc_reply_empty(conn, req_id);
+      }
+      request.advance_read(compressed_size);
+      state = kStateRecvHeader;
+      req_size = 0;
+      compressed_size = 0;
     }
-    }
-    request.advance_read(compressed_size);
-    state = kStateRecvHeader;
-    req_size = 0;
-    compressed_size = 0;
+  } catch (std::exception const &e) {
+    fmt::print("RPC server error: {}\n", e.what());
   }
 }
 
@@ -578,10 +665,11 @@ task<std::vector<char>> send_rpc_request(conn_pool &pool,
   uint32_t req_size = body.size();
   char *body_pointer = &body[0];
   auto [compressed, compressed_len] = [&]() {
-    if (m != method::list && m != method::batch) {
+    if (m != method::list && m != method::batch && m != method::cbatch) {
       return std::make_pair(std::vector<char>(), req_size);
     }
-    std::vector<char> compressed(m == method::batch || m == method::list
+    std::vector<char> compressed(m == method::batch || m == method::list ||
+                                         m == method::cbatch
                                      ? ZSTD_compressBound(body.size())
                                      : 0);
     uint32_t compressed_len = ZSTD_compress(&compressed[0], compressed.size(),
@@ -662,6 +750,23 @@ task<bool> remote_add(conn_pool &pool, std::string_view key,
   co_return success;
 }
 
+task<bool> remote_cadd(conn_pool &pool, std::string_view key,
+                       std::string_view value) {
+  auto body_size = key.size() + value.size() + sizeof(uint32_t) * 2;
+  auto body = std::vector<char>(body_size);
+  auto body_p = &body[0];
+  *reinterpret_cast<uint32_t *>(body_p) = key.size();
+  body_p += sizeof(uint32_t);
+  std::copy_n(key.data(), key.size(), body_p);
+  body_p += key.size();
+  *reinterpret_cast<uint32_t *>(body_p) = value.size();
+  body_p += sizeof(uint32_t);
+  std::copy_n(value.data(), value.size(), body_p);
+  auto response = co_await rpc_call(pool, method::cadd, std::move(body));
+  bool success = response.empty();
+  co_return success;
+}
+
 task<void> remote_del(conn_pool &pool, std::string_view key) {
   auto body_size = key.size() + sizeof(uint32_t);
   auto body = std::vector<char>(body_size);
@@ -670,6 +775,16 @@ task<void> remote_del(conn_pool &pool, std::string_view key) {
   body_p += sizeof(uint32_t);
   std::copy_n(key.data(), key.size(), body_p);
   co_await rpc_call(pool, method::del, std::move(body));
+}
+
+task<void> remote_cdel(conn_pool &pool, std::string_view key) {
+  auto body_size = key.size() + sizeof(uint32_t);
+  auto body = std::vector<char>(body_size);
+  auto body_p = &body[0];
+  *reinterpret_cast<uint32_t *>(body_p) = key.size();
+  body_p += sizeof(uint32_t);
+  std::copy_n(key.data(), key.size(), body_p);
+  co_await rpc_call(pool, method::cdel, std::move(body));
 }
 
 task<void> remote_batch(
@@ -694,6 +809,30 @@ task<void> remote_batch(
     body_p += kv.second.size();
   }
   co_await rpc_call(pool, method::batch, std::move(body));
+}
+
+task<void> remote_cbatch(
+    conn_pool &pool,
+    std::unordered_map<std::string_view, std::string_view> const &kvs) {
+  auto body_size = sizeof(uint32_t);
+  for (auto const kv : kvs) {
+    body_size += sizeof(uint32_t) * 2 + kv.first.size() + kv.second.size();
+  }
+  auto body = std::vector<char>(body_size);
+  auto body_p = &body[0];
+  *reinterpret_cast<uint32_t *>(body_p) = kvs.size();
+  body_p += sizeof(uint32_t);
+  for (auto const kv : kvs) {
+    *reinterpret_cast<uint32_t *>(body_p) = kv.first.size();
+    body_p += sizeof(uint32_t);
+    std::copy_n(kv.first.data(), kv.first.size(), body_p);
+    body_p += kv.first.size();
+    *reinterpret_cast<uint32_t *>(body_p) = kv.second.size();
+    body_p += sizeof(uint32_t);
+    std::copy_n(kv.second.data(), kv.second.size(), body_p);
+    body_p += kv.second.size();
+  }
+  co_await rpc_call(pool, method::cbatch, std::move(body));
 }
 
 task<std::pair<std::vector<char>, std::vector<key_value_view>>>
@@ -1053,13 +1192,25 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
               co_await send_text(conn, value->data(), value->size());
             }
           } else {
-            auto value =
-                co_await remote_query(rpc_clients[key_shard][conn_shard], key);
-            if (!value.has_value()) {
-              co_await send_all(conn, HTTP_404, sizeof(HTTP_404) - 1);
+            std::string cached_value;
+            auto cached =
+                remote_cache.find(key, [&cached_value](auto &kv, ...) {
+                  cached_value = kv.value;
+                });
+            if (cached) {
+              co_await send_text(conn, cached_value.data(),
+                                 cached_value.size());
+
             } else {
-              co_await send_text(conn, (char *)value->second.data(),
-                                 value->second.size());
+              auto value = co_await remote_query(
+                  rpc_clients[key_shard][conn_shard], key);
+              if (!value.has_value()) {
+                co_await send_all(conn, HTTP_404, sizeof(HTTP_404) - 1);
+              } else {
+                co_await send_text(conn, (char *)value->second.data(),
+                                   value->second.size());
+                insert_cache(key, value->second);
+              }
             }
           }
         } break;
@@ -1071,6 +1222,13 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
             store->del(key);
           } else {
             co_await remote_del(rpc_clients[key_shard][conn_shard], key);
+            remove_cache_entry(key);
+            for (size_t i = 0; i < nr_peers; ++i) {
+              if (i == me || i == key_shard) {
+                continue;
+              }
+              remote_cdel(rpc_clients[i][conn_shard], key).detach();
+            }
           }
           co_await send_all(conn, EMPTY_RESPONSE, sizeof(EMPTY_RESPONSE) - 1);
         } break;
@@ -1093,11 +1251,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
             if (i == me) {
               continue;
             }
-            tasks.emplace_back(
-                remote_zrmv(rpc_clients[i][conn_shard], key, value));
-          }
-          for (auto &t : tasks) {
-            co_await t;
+            remote_zrmv(rpc_clients[i][conn_shard], key, value).detach();
           }
         } break;
         }
@@ -1153,6 +1307,13 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
           } else {
             success = co_await remote_add(rpc_clients[key_shard][conn_shard],
                                           key, value);
+            insert_cache(key, value);
+            for (size_t i = 0; i < nr_peers; ++i) {
+              if (i == me || i == key_shard) {
+                continue;
+              }
+              remote_cadd(rpc_clients[i][conn_shard], key, value).detach();
+            }
           }
           if (success) {
             co_await send_all(conn, EMPTY_RESPONSE, sizeof(EMPTY_RESPONSE) - 1);
@@ -1178,6 +1339,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
               store->add_batch(batch, key, value);
             } else {
               sharded_keys[key_shard][key] = value;
+              insert_cache(key, value);
             }
           }
           std::vector<task<void>> tasks;
@@ -1187,6 +1349,13 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
             }
             tasks.emplace_back(remote_batch(rpc_clients[key_shard][conn_shard],
                                             sharded_keys[key_shard]));
+            for (size_t i = 0; i < nr_peers; ++i) {
+              if (i == me || i == key_shard) {
+                continue;
+              }
+              remote_cbatch(rpc_clients[i][conn_shard], sharded_keys[key_shard])
+                  .detach();
+            }
           }
           store->commit_batch(batch);
           for (auto &task : tasks) {
@@ -1204,14 +1373,30 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
           std::unordered_set<std::string_view> keys;
           std::vector<std::unordered_set<std::string_view>> sharded_keys(
               nr_peers);
+          std::vector<std::unordered_set<std::string_view>> cached_keys(
+              nr_peers);
           std::vector<std::vector<key_value_view>> remote_key_values;
+          std::vector<key_view_value> cached_key_values;
           for (auto &&k : arr) {
             auto key = k.get_string().take_value();
             auto key_shard = get_shard(key);
             if (key_shard == me) {
               keys.insert(key);
             } else {
-              sharded_keys[key_shard].insert(key);
+              if (sharded_keys[key_shard].count(key) ||
+                  cached_keys[key_shard].count(key)) {
+                continue;
+              }
+              key_view_value cached_value;
+              if (remote_cache.find(key, [&](auto &kv, ...) {
+                    cached_value.key = kv.key;
+                    cached_value.value = kv.value;
+                  })) {
+                cached_key_values.emplace_back(std::move(cached_value));
+                cached_keys[key_shard].insert(key);
+              } else {
+                sharded_keys[key_shard].insert(key);
+              }
             }
           }
           auto remote_kv_count = 0;
@@ -1233,7 +1418,8 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
             remote_buffers.emplace_back(std::move(remote_kvs.first));
             remote_key_values.emplace_back(std::move(remote_kvs.second));
           }
-          if (local_key_values.empty() && remote_kv_count == 0) {
+          if (local_key_values.empty() && cached_key_values.empty() &&
+              remote_kv_count == 0) {
             co_await send_all(conn, HTTP_404, sizeof(HTTP_404) - 1);
           } else {
             if (local_key_values.size() + remote_kv_count < 10000000) {
@@ -1257,8 +1443,12 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
                 for (auto &kv : local_key_values) {
                   write_kv(kv.key, kv.value);
                 }
+                for (auto &kv : cached_key_values) {
+                  write_kv(kv.key, kv.value);
+                }
                 for (auto const &remote_kvs : remote_key_values) {
                   for (auto const kv : remote_kvs) {
+                    insert_cache(kv.key, kv.value);
                     write_kv(kv.key, kv.value);
                   }
                 }
@@ -1299,8 +1489,12 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
               for (auto &kv : local_key_values) {
                 co_await write_kv(kv.key, kv.value);
               }
+              for (auto &kv : cached_key_values) {
+                co_await write_kv(kv.key, kv.value);
+              }
               for (auto const &remote_kvs : remote_key_values) {
                 for (auto const kv : remote_kvs) {
+                  insert_cache(kv.key, kv.value);
                   co_await write_kv(kv.key, kv.value);
                 }
               }
@@ -1325,16 +1519,12 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
             auto key_shard = get_shard(key);
             store->zadd(key, value, score);
             co_await send_all(conn, EMPTY_RESPONSE, sizeof(EMPTY_RESPONSE) - 1);
-            std::vector<task<bool>> tasks;
             for (size_t i = 0; i < nr_peers; i++) {
               if (i == me) {
                 continue;
               }
-              tasks.emplace_back(
-                  remote_zadd(rpc_clients[i][conn_shard], key, value, score));
-            }
-            for (auto &t : tasks) {
-              co_await t;
+              remote_zadd(rpc_clients[i][conn_shard], key, value, score)
+                  .detach();
             }
           } break;
           case 'r': {
@@ -1469,6 +1659,8 @@ void db_flusher() {
 }
 
 int main(int argc, char *argv[]) {
+  cds::Initialize();
+  cds::gc::HP gchp;
   main_loop = loop_with_queue::create(4096);
   main_loop->waker().detach();
   ::signal(SIGPIPE, SIG_IGN);
@@ -1488,6 +1680,7 @@ int main(int argc, char *argv[]) {
   rpc_loops[0] = main_loop;
   for (int i = 1; i < cores.size(); ++i) {
     auto thread = std::thread([i, core = cores[i]] {
+      cds::threading::Manager::attachThread();
       fmt::print("thread {} bind to core {}\n", i, core);
       bind_cpu(core);
       auto loop = loop_with_queue::create(4096, IORING_SETUP_ATTACH_WQ,
