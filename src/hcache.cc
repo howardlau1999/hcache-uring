@@ -360,9 +360,11 @@ bool remove_cache_entry(std::string_view key) {
 
 void evict_cache() {
   while (!evict_queue.empty()) {
-    std::string_view key;
+    std::string key;
     evict_queue.pop(key);
-    remove_cache_entry(key);
+    if (remove_cache_entry(key)) {
+      return;
+    }
   }
 }
 
@@ -1251,7 +1253,8 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
             if (i == me) {
               continue;
             }
-            tasks.emplace_back(remote_zrmv(rpc_clients[i][conn_shard], key, value));
+            tasks.emplace_back(
+                remote_zrmv(rpc_clients[i][conn_shard], key, value));
           }
           for (auto &t : tasks) {
             co_await t;
@@ -1343,24 +1346,30 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
             }
           }
           std::vector<task<void>> tasks;
+          std::vector<task<void>> cache_tasks;
           for (auto key_shard = 0; key_shard < nr_peers; ++key_shard) {
             if (key_shard == me) {
               continue;
             }
             tasks.emplace_back(std::move(remote_batch(
                 rpc_clients[key_shard][conn_shard], sharded_keys[key_shard])));
-            for (size_t i = 0; i < nr_peers; ++i) {
-              if (i == me || i == key_shard) {
-                continue;
-              }
-              tasks.emplace_back(std::move(remote_cbatch(
-                  rpc_clients[i][conn_shard], sharded_keys[key_shard])));
-            }
           }
           store->commit_batch(batch);
           co_await send_all(conn, EMPTY_RESPONSE, sizeof(EMPTY_RESPONSE) - 1);
           for (auto &task : tasks) {
             co_await task;
+          }
+          for (auto key_shard = 0; key_shard < nr_peers; ++key_shard) {
+            for (size_t i = 0; i < nr_peers; ++i) {
+              if (i == me || i == key_shard) {
+                continue;
+              }
+              cache_tasks.emplace_back(std::move(remote_cbatch(
+                  rpc_clients[i][conn_shard], sharded_keys[key_shard])));
+            }
+          }
+          for (auto &t : cache_tasks) {
+            co_await t;
           }
         } break;
         case 'l': {
@@ -1527,7 +1536,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
               tasks.emplace_back(std::move(
                   remote_zadd(rpc_clients[i][conn_shard], key, value, score)));
             }
-            for (auto & t : tasks) {
+            for (auto &t : tasks) {
               co_await t;
             }
           } break;

@@ -101,7 +101,7 @@ using unordered_string_set = multi_index_container<
                       string_view_hash, string_view_equal_to>>>;
 
 typedef cds::container::OptimisticQueue<
-    cds::gc::HP, std::string_view,
+    cds::gc::HP, std::string,
     typename cds::container::optimistic_queue::make_traits<>::type>
     fifo_queue;
 
