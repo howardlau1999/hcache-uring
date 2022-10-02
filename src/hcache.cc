@@ -1,4 +1,5 @@
 #include "cds/init.h"
+#include "cds/threading/details/pthread_manager.h"
 #include "io_buffer.h"
 #include "rapidjson/stringbuffer.h"
 #include "rpc.h"
@@ -1691,6 +1692,7 @@ int main(int argc, char *argv[]) {
   loop_started.fetch_add(1);
   loops[0] = main_loop;
   rpc_loops[0] = main_loop;
+  cds::threading::Manager::attachThread();
   for (int i = 1; i < cores.size(); ++i) {
     auto thread = std::thread([i, core = cores[i]] {
       cds::threading::Manager::attachThread();
