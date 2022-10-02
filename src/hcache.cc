@@ -397,7 +397,7 @@ void insert_cache(std::string_view key, std::string_view value) {
 }
 
 task<void> handle_rpc(uringpp::socket conn, size_t conn_id) {
-  auto loop = rpc_loops[(conn_id % (rpc_loops.size() - 1)) + 1];
+  auto loop = rpc_loops[conn_id % rpc_loops.size()];
   co_await loop->switch_to_io_thread();
   io_buffer request(65536);
   int state = kStateRecvHeader;
@@ -1014,8 +1014,8 @@ task<void> rpc_server(std::shared_ptr<loop_with_queue> loop, std::string port) {
   fmt::print("Starting RPC server\n");
   connect_rpc_client(port).detach();
   while (true) {
-    auto [addr, conn] = co_await listener.accept(
-        rpc_loops[(rpc_conn_id % (rpc_loops.size() - 1)) + 1]);
+    auto [addr, conn] =
+        co_await listener.accept(rpc_loops[rpc_conn_id % rpc_loops.size()]);
     {
       int flags = 1;
       setsockopt(conn.fd(), SOL_TCP, TCP_NODELAY, (void *)&flags,
@@ -1086,7 +1086,7 @@ task<void> send_score_values(uringpp::socket &conn, size_t count, It begin,
 }
 
 task<void> handle_http(uringpp::socket conn, size_t conn_id) {
-  auto conn_shard = (conn_id % (loops.size() - 1)) + 1;
+  auto conn_shard = conn_id % loops.size();
   auto loop = loops[conn_shard];
   co_await loop->switch_to_io_thread();
   try {
@@ -1599,7 +1599,7 @@ task<void> http_server(std::shared_ptr<loop_with_queue> loop) {
   while (true) {
     try {
       auto [addr, conn] =
-          co_await listener.accept(loops[(conn_id % (loops.size() - 1)) + 1]);
+          co_await listener.accept(loops[conn_id % loops.size()]);
       {
         int flags = 1;
         setsockopt(conn.fd(), SOL_TCP, TCP_NODELAY, (void *)&flags,
