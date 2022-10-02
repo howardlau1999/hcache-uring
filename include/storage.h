@@ -53,6 +53,10 @@ struct string_hash {
 
 using ankerlkv = ankerl::unordered_dense::map<std::string, std::string,
                                               string_hash, std::equal_to<>>;
+                                              
+using ankerlkvview = ankerl::unordered_dense::map<std::string_view, std::string_view,
+                                              string_hash, std::equal_to<>>;
+                                              
 
 template <typename T, typename Q> struct mutable_pair {
   T first;

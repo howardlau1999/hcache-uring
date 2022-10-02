@@ -49,6 +49,15 @@ struct send_conn_state {
   std::unique_ptr<uringpp::socket> conn;
 };
 
+struct changeset {
+  std::vector<key_value> sending;
+  std::vector<key_value> pending;
+  bool syncing = false;
+  std::coroutine_handle<> h;
+};
+
+std::vector<std::vector<changeset>> changesets;
+
 task<void> rpc_reply_recv_loop(uringpp::socket &rpc_conn);
 
 struct conn_pool {
@@ -495,7 +504,11 @@ task<void> handle_rpc(uringpp::socket conn, size_t conn_id) {
         req_p += sizeof(value_size);
         std::string_view value(req_p, value_size);
         req_p += value_size;
-        update_cache(key, value);
+        if (value_size == 0) {
+          update_cache(key, value);
+        } else {
+          remove_cache_entry(key);
+        }
         co_await rpc_reply_empty(conn, req_id);
       } break;
       case method::del: {
@@ -578,7 +591,11 @@ task<void> handle_rpc(uringpp::socket conn, size_t conn_id) {
           req_p += sizeof(value_size);
           std::string_view value(req_p, value_size);
           req_p += value_size;
-          update_cache(key, value);
+          if (value_size == 0) {
+            update_cache(key, value);
+          } else {
+            remove_cache_entry(key);
+          }
         }
         co_await t;
       } break;
@@ -790,9 +807,7 @@ task<void> remote_cdel(conn_pool &pool, std::string_view key) {
   co_await rpc_call(pool, method::cdel, std::move(body));
 }
 
-task<void> remote_batch(
-    conn_pool &pool,
-    std::unordered_map<std::string_view, std::string_view> const &kvs) {
+task<void> remote_batch(conn_pool &pool, ankerlkvview const &kvs) {
   auto body_size = sizeof(uint32_t);
   for (auto const kv : kvs) {
     body_size += sizeof(uint32_t) * 2 + kv.first.size() + kv.second.size();
@@ -814,9 +829,73 @@ task<void> remote_batch(
   co_await rpc_call(pool, method::batch, std::move(body));
 }
 
-task<void> remote_cbatch(
-    conn_pool &pool,
-    std::unordered_map<std::string_view, std::string_view> const &kvs) {
+task<void> sync_changeset(size_t key_shard, size_t conn_shard) {
+  auto &pool = rpc_clients[key_shard][conn_shard];
+  auto &cs = changesets[key_shard][conn_shard];
+  for (;;) {
+    if (cs.sending.empty() && cs.pending.empty()) {
+      cs.syncing = false;
+      co_await std::suspend_always{};
+    }
+    if (cs.sending.empty()) {
+      std::swap(cs.sending, cs.pending);
+    }
+    cs.syncing = true;
+    auto const &kvs = cs.sending;
+    {
+      auto body_size = sizeof(uint32_t);
+      for (auto const kv : kvs) {
+        body_size += sizeof(uint32_t) * 2 + kv.key.size() + kv.value.size();
+      }
+      auto body = std::vector<char>(body_size);
+      auto body_p = &body[0];
+      *reinterpret_cast<uint32_t *>(body_p) = kvs.size();
+      body_p += sizeof(uint32_t);
+      for (auto const kv : kvs) {
+        *reinterpret_cast<uint32_t *>(body_p) = kv.key.size();
+        body_p += sizeof(uint32_t);
+        std::copy_n(kv.key.data(), kv.key.size(), body_p);
+        body_p += kv.key.size();
+        *reinterpret_cast<uint32_t *>(body_p) = kv.value.size();
+        body_p += sizeof(uint32_t);
+        std::copy_n(kv.value.data(), kv.value.size(), body_p);
+        body_p += kv.value.size();
+      }
+      cs.sending.clear();
+      co_await rpc_call(pool, method::cbatch, std::move(body));
+    }
+  }
+}
+
+void add_changeset(size_t key_shard, size_t conn_shard, std::string_view key,
+                   std::string_view value) {
+  auto &cs = changesets[key_shard][conn_shard];
+  cs.pending.emplace_back(key, value);
+  if (!cs.syncing) {
+    cs.h.resume();
+  }
+}
+
+void del_changeset(size_t key_shard, size_t conn_shard, std::string_view key) {
+  auto &cs = changesets[key_shard][conn_shard];
+  cs.pending.emplace_back(key, std::string());
+  if (!cs.syncing) {
+    cs.h.resume();
+  }
+}
+
+void batch_add_changeset(size_t key_shard, size_t conn_shard,
+                         ankerlkvview const &kvs) {
+  auto &cs = changesets[key_shard][conn_shard];
+  for (auto const kv : kvs) {
+    cs.pending.emplace_back(kv.first, kv.second);
+  }
+  if (!cs.syncing) {
+    cs.h.resume();
+  }
+}
+
+task<void> remote_cbatch(conn_pool &pool, ankerlkvview const &kvs) {
   auto body_size = sizeof(uint32_t);
   for (auto const kv : kvs) {
     body_size += sizeof(uint32_t) * 2 + kv.first.size() + kv.second.size();
@@ -1226,12 +1305,12 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
           } else {
             co_await remote_del(rpc_clients[key_shard][conn_shard], key);
             remove_cache_entry(key);
-            for (size_t i = 0; i < nr_peers; ++i) {
-              if (i == me || i == key_shard) {
-                continue;
-              }
-              remote_cdel(rpc_clients[i][conn_shard], key).detach();
+          }
+          for (size_t i = 0; i < nr_peers; ++i) {
+            if (i == me || i == key_shard) {
+              continue;
             }
+            del_changeset(i, conn_shard, key);
           }
           co_await send_all(conn, EMPTY_RESPONSE, sizeof(EMPTY_RESPONSE) - 1);
         } break;
@@ -1317,12 +1396,12 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
                                           key, value);
             insert_cache(key, value);
             co_await send_all(conn, EMPTY_RESPONSE, sizeof(EMPTY_RESPONSE) - 1);
-            for (size_t i = 0; i < nr_peers; ++i) {
-              if (i == me || i == key_shard) {
-                continue;
-              }
-              co_await remote_cadd(rpc_clients[i][conn_shard], key, value);
+          }
+          for (size_t i = 0; i < nr_peers; ++i) {
+            if (i == me || i == key_shard) {
+              continue;
             }
+            add_changeset(i, conn_shard, key, value);
           }
         } break;
         case 'b': {
@@ -1332,8 +1411,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
                                                        request.read_idx());
           auto doc = parser.parse(json);
           auto arr = doc.get_array().take_value();
-          std::vector<std::unordered_map<std::string_view, std::string_view>>
-              sharded_keys(nr_peers);
+          std::vector<ankerlkvview> sharded_keys(nr_peers);
           auto batch = store->start_batch();
           for (auto &&kv : arr) {
             auto const key = kv["key"].get_string().take_value();
@@ -1347,7 +1425,6 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
             }
           }
           std::vector<task<void>> tasks;
-          std::vector<task<void>> cache_tasks;
           for (auto key_shard = 0; key_shard < nr_peers; ++key_shard) {
             if (key_shard == me) {
               continue;
@@ -1365,12 +1442,8 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
               if (i == me || i == key_shard) {
                 continue;
               }
-              cache_tasks.emplace_back(std::move(remote_cbatch(
-                  rpc_clients[i][conn_shard], sharded_keys[key_shard])));
+              batch_add_changeset(i, conn_shard, sharded_keys[key_shard]);
             }
-          }
-          for (auto &t : cache_tasks) {
-            co_await t;
           }
         } break;
         case 'l': {
@@ -1641,6 +1714,7 @@ task<void> connect_rpc_client(std::string port) {
       peer_hosts.emplace_back(host.get_string().take_value());
     }
     rpc_clients.resize(hosts.size());
+    changesets.resize(hosts.size());
     peers_updated = true;
     for (size_t peer_idx = 0; peer_idx < nr_peers; ++peer_idx) {
       if (peer_idx == me) {
@@ -1649,10 +1723,14 @@ task<void> connect_rpc_client(std::string port) {
       auto const &host = peer_hosts[peer_idx];
       fmt::print("Connecting to {}:{}\n", host, port);
       rpc_clients[peer_idx].resize(loops.size());
+      changesets[peer_idx].resize(loops.size());
       for (size_t lidx = 0; lidx < loops.size(); ++lidx) {
         rpc_clients[peer_idx][lidx].host = host;
         rpc_clients[peer_idx][lidx].port = port;
         rpc_clients[peer_idx][lidx].loop = loops[lidx];
+        auto t = sync_changeset(peer_idx, lidx);
+        changesets[peer_idx][lidx].h = t.h_;
+        t.detach();
       }
     }
     rpc_connected = true;
