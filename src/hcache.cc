@@ -58,10 +58,10 @@ struct changeset {
 
 std::vector<std::vector<changeset>> changesets;
 
-task<void> rpc_reply_recv_loop(uringpp::socket &rpc_conn);
+task<void> rpc_reply_recv_loop(uringpp::socket &rpc_conn, std::string);
 
 struct conn_pool {
-  static constexpr size_t kMaxConns = 256;
+  static constexpr size_t kMaxConns = 512;
   std::shared_ptr<loop_with_queue> loop;
   std::queue<std::coroutine_handle<>> waiters;
   std::string host;
@@ -93,7 +93,7 @@ struct conn_pool {
     auto state = new send_conn_state{
         std::make_unique<uringpp::socket>(std::move(rpc_conn))};
 
-    rpc_reply_recv_loop(*state->conn).detach();
+    rpc_reply_recv_loop(*state->conn, host).detach();
     co_return state;
   }
 
@@ -398,11 +398,11 @@ void insert_cache(std::string_view key, std::string_view value) {
   if (!is_new) {
     mi_disposer<key_value_intl>()(kv);
   } else {
-    evict_queue.enqueue(kv->key);
     if (cached_count.fetch_add(1, std::memory_order_relaxed) >=
         kMaxCacheCount) {
       evict_cache();
     }
+    evict_queue.enqueue(kv->key);
   }
 }
 
@@ -842,32 +842,40 @@ task<void> sync_changeset(size_t key_shard, size_t conn_shard) {
     }
     cs.syncing = true;
     auto const &kvs = cs.sending;
-    {
+    size_t i = 0;
+    while (i < kvs.size()) {
       auto body_size = sizeof(uint32_t);
-      for (auto const kv : kvs) {
+      constexpr size_t kMaxSize = 1024 * 1024 * 1;
+      size_t start = i;
+      while (body_size < kMaxSize && i < kvs.size()) {
+        auto const &kv = kvs[i++];
         body_size += sizeof(uint32_t) * 2 + kv.key.size() + kv.value.size();
       }
       auto body = std::vector<char>(body_size);
       auto body_p = &body[0];
-      *reinterpret_cast<uint32_t *>(body_p) = kvs.size();
+      *reinterpret_cast<uint32_t *>(body_p) = i - start;
       body_p += sizeof(uint32_t);
-      for (auto const kv : kvs) {
+      while (start < i) {
+        auto const &kv = kvs[start++];
         *reinterpret_cast<uint32_t *>(body_p) = kv.key.size();
         body_p += sizeof(uint32_t);
         std::copy_n(kv.key.data(), kv.key.size(), body_p);
         body_p += kv.key.size();
-        *reinterpret_cast<uint32_t *>(body_p) = 0;
+        *reinterpret_cast<uint32_t *>(body_p) = kv.value.size();
+        body_p += sizeof(uint32_t);
+        std::copy_n(kv.value.data(), kv.value.size(), body_p);
+        body_p += kv.value.size();
       }
-      cs.sending.clear();
       co_await rpc_call(pool, method::cbatch, std::move(body));
     }
+    cs.sending.clear();
   }
 }
 
 void add_changeset(size_t key_shard, size_t conn_shard, std::string_view key,
                    std::string_view value) {
   auto &cs = changesets[key_shard][conn_shard];
-  cs.pending.emplace_back(key, std::string());
+  cs.pending.emplace_back(key, value);
   if (!cs.syncing) {
     cs.h.resume();
   }
@@ -1017,7 +1025,7 @@ task<void> remote_zrmv(conn_pool &pool, std::string_view key,
   co_await rpc_call(pool, method::zrmv, std::move(body));
 }
 
-task<void> rpc_reply_recv_loop(uringpp::socket &rpc_conn) {
+task<void> rpc_reply_recv_loop(uringpp::socket &rpc_conn, std::string host) {
   io_buffer response(65536);
   int state = kStateRecvHeader;
   uint32_t rep_size = 0;
@@ -1055,7 +1063,7 @@ task<void> rpc_reply_recv_loop(uringpp::socket &rpc_conn) {
         if (n < 0) {
           fmt::print("recv error: {}\n", strerror(-n));
         }
-        fmt::print("recv loop exit\n");
+        fmt::print("recv loop exit {}\n", host);
         co_return;
       }
       response.advance_write(n);
@@ -1330,11 +1338,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
             if (i == me) {
               continue;
             }
-            tasks.emplace_back(
-                remote_zrmv(rpc_clients[i][conn_shard], key, value));
-          }
-          for (auto &t : tasks) {
-            co_await t;
+            co_await remote_zrmv(rpc_clients[i][conn_shard], key, value);
           }
         } break;
         }
@@ -1604,11 +1608,8 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
               if (i == me) {
                 continue;
               }
-              tasks.emplace_back(std::move(
-                  remote_zadd(rpc_clients[i][conn_shard], key, value, score)));
-            }
-            for (auto &t : tasks) {
-              co_await t;
+              co_await remote_zadd(rpc_clients[i][conn_shard], key, value,
+                                   score);
             }
           } break;
           case 'r': {
