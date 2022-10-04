@@ -672,9 +672,7 @@ task<void> remote_del(conn_pool &pool, std::string_view key) {
   co_await rpc_call(pool, method::del, std::move(body));
 }
 
-task<void> remote_batch(
-    conn_pool &pool,
-    std::unordered_map<std::string_view, std::string_view> const &kvs) {
+task<void> remote_batch(conn_pool &pool, ankerlkvview const &kvs) {
   auto body_size = sizeof(uint32_t);
   for (auto const kv : kvs) {
     body_size += sizeof(uint32_t) * 2 + kv.first.size() + kv.second.size();
@@ -697,7 +695,7 @@ task<void> remote_batch(
 }
 
 task<std::pair<std::vector<char>, std::vector<key_value_view>>>
-remote_list(conn_pool &pool, std::unordered_set<std::string_view> const &keys) {
+remote_list(conn_pool &pool, ankerlkvset const &keys) {
   auto body_size = sizeof(uint32_t);
   for (auto const &key : keys) {
     body_size += sizeof(uint32_t) + key.size();
@@ -873,8 +871,8 @@ task<void> rpc_server(std::shared_ptr<loop_with_queue> loop, std::string port) {
   fmt::print("Starting RPC server\n");
   connect_rpc_client(port).detach();
   while (true) {
-    auto [addr, conn] = co_await listener.accept(
-        rpc_loops[rpc_conn_id % rpc_loops.size()]);
+    auto [addr, conn] =
+        co_await listener.accept(rpc_loops[rpc_conn_id % rpc_loops.size()]);
     {
       int flags = 1;
       setsockopt(conn.fd(), SOL_TCP, TCP_NODELAY, (void *)&flags,
@@ -1167,8 +1165,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
                                                        request.read_idx());
           auto doc = parser.parse(json);
           auto arr = doc.get_array().take_value();
-          std::vector<std::unordered_map<std::string_view, std::string_view>>
-              sharded_keys(nr_peers);
+          std::vector<ankerlkvview> sharded_keys(nr_peers);
           auto batch = store->start_batch();
           for (auto &&kv : arr) {
             auto const key = kv["key"].get_string().take_value();
@@ -1201,9 +1198,8 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
                                                        request.read_idx());
           auto doc = parser.parse(json);
           auto arr = doc.get_array().take_value();
-          std::unordered_set<std::string_view> keys;
-          std::vector<std::unordered_set<std::string_view>> sharded_keys(
-              nr_peers);
+          ankerlkvset keys;
+          std::vector<ankerlkvset> sharded_keys(nr_peers);
           std::vector<std::vector<key_value_view>> remote_key_values;
           for (auto &&k : arr) {
             auto key = k.get_string().take_value();
@@ -1469,7 +1465,7 @@ void db_flusher() {
 }
 
 int main(int argc, char *argv[]) {
-  main_loop = loop_with_queue::create(4096);
+  main_loop = loop_with_queue::create(65536);
   main_loop->waker().detach();
   ::signal(SIGPIPE, SIG_IGN);
   cores = get_cpu_affinity();
@@ -1490,7 +1486,7 @@ int main(int argc, char *argv[]) {
     auto thread = std::thread([i, core = cores[i]] {
       fmt::print("thread {} bind to core {}\n", i, core);
       bind_cpu(core);
-      auto loop = loop_with_queue::create(4096, IORING_SETUP_ATTACH_WQ,
+      auto loop = loop_with_queue::create(65536, IORING_SETUP_ATTACH_WQ,
                                           main_loop->fd());
       loops[i] = loop;
       rpc_loops[i] = loop;

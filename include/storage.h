@@ -51,7 +51,8 @@ struct string_hash {
 };
 
 using ankerlkv = ankerl::unordered_dense::map<std::string, std::string, string_hash, std::equal_to<>>;
-
+using ankerlkvview = ankerl::unordered_dense::map<std::string_view, std::string_view, string_hash, std::equal_to<>>;
+using ankerlkvset = ankerl::unordered_dense::set<std::string_view, string_hash, std::equal_to<>>;
 
 template <typename T, typename Q> struct mutable_pair {
   T first;
@@ -229,8 +230,8 @@ public:
   bool kv_loaded() const { return kv_initialized_; }
 
   std::vector<key_view_value>
-  list(std::unordered_set<std::string_view>::iterator begin,
-       std::unordered_set<std::string_view>::iterator end) {
+  list(ankerlkvset::iterator begin,
+       ankerlkvset::iterator end) {
     std::vector<key_view_value> ret;
     for (auto it = begin; it != end; ++it) {
       if (auto v = query(*it); v.has_value()) {
@@ -240,17 +241,6 @@ public:
     return ret;
   }
 
-  std::vector<key_view_value>
-  list(std::vector<std::string_view>::iterator begin,
-       std::vector<std::string_view>::iterator end) {
-    std::vector<key_view_value> ret;
-    for (auto it = begin; it != end; ++it) {
-      if (auto v = query(*it); v.has_value()) {
-        ret.emplace_back(std::move(*it), v.value());
-      }
-    }
-    return ret;
-  }
 
   std::optional<std::string> query(std::string_view key);
 
