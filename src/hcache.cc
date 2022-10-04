@@ -31,8 +31,6 @@
 #include <strings.h>
 #include <sys/socket.h>
 #include <thread>
-#include <unordered_map>
-#include <unordered_set>
 #include <uringpp/event_loop.h>
 #include <uringpp/file.h>
 #include <uringpp/listener.h>
@@ -1465,7 +1463,7 @@ void db_flusher() {
 }
 
 int main(int argc, char *argv[]) {
-  main_loop = loop_with_queue::create(65536);
+  main_loop = loop_with_queue::create(8192);
   main_loop->waker().detach();
   ::signal(SIGPIPE, SIG_IGN);
   cores = get_cpu_affinity();
@@ -1486,7 +1484,7 @@ int main(int argc, char *argv[]) {
     auto thread = std::thread([i, core = cores[i]] {
       fmt::print("thread {} bind to core {}\n", i, core);
       bind_cpu(core);
-      auto loop = loop_with_queue::create(65536, IORING_SETUP_ATTACH_WQ,
+      auto loop = loop_with_queue::create(8192, IORING_SETUP_ATTACH_WQ,
                                           main_loop->fd());
       loops[i] = loop;
       rpc_loops[i] = loop;
