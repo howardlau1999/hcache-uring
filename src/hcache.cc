@@ -1311,13 +1311,13 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
             co_await remote_del(rpc_clients[key_shard][conn_shard], key);
             remove_cache_entry(key);
           }
+          co_await send_all(conn, EMPTY_RESPONSE, sizeof(EMPTY_RESPONSE) - 1);
           for (size_t i = 0; i < nr_peers; ++i) {
             if (i == me || i == key_shard) {
               continue;
             }
             del_changeset(i, conn_shard, key);
           }
-          co_await send_all(conn, EMPTY_RESPONSE, sizeof(EMPTY_RESPONSE) - 1);
         } break;
         case 'z': {
           // zrmv
@@ -1391,13 +1391,12 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
           bool success = false;
           if (key_shard == me) {
             success = store->add(key, value);
-            co_await send_all(conn, EMPTY_RESPONSE, sizeof(EMPTY_RESPONSE) - 1);
           } else {
             success = co_await remote_add(rpc_clients[key_shard][conn_shard],
                                           key, value);
             insert_cache(key, value);
-            co_await send_all(conn, EMPTY_RESPONSE, sizeof(EMPTY_RESPONSE) - 1);
           }
+          co_await send_all(conn, EMPTY_RESPONSE, sizeof(EMPTY_RESPONSE) - 1);
           for (size_t i = 0; i < nr_peers; ++i) {
             if (i == me || i == key_shard) {
               continue;
@@ -1472,8 +1471,8 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
                 continue;
               }
               key_view_value cached_value;
+              cached_value.key = key;
               if (remote_cache.find(key, [&](auto &kv, ...) {
-                    cached_value.key = kv.key;
                     cached_value.value = kv.value;
                   })) {
                 cached_key_values.emplace_back(std::move(cached_value));
