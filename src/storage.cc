@@ -379,14 +379,6 @@ bool storage::zadd(std::string_view key, std::string_view value,
   //     return false;
   //   }
   // }
-  bool is_new = zadd_no_persist(key, value, score);
-  if (is_new) {
-    std::vector<char> placeholder(key.begin(), key.end());
-    placeholder.push_back(0);
-    zset_db_->Put(write_options_,
-                  rocksdb::Slice(placeholder.data(), placeholder.size()),
-                  rocksdb::Slice());
-  }
   auto full_key = encode_zset_key(key, value);
   zset_db_->Put(
       write_options_, rocksdb::Slice(full_key.data(), full_key.size()),

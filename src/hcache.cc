@@ -1456,7 +1456,7 @@ task<void> connect_rpc_client(std::string port) {
 void db_flusher() {
   std::thread([] {
     while (true) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(500));
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
       store->flush();
     }
   }).detach();
