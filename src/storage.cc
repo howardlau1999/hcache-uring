@@ -297,20 +297,20 @@ void storage::del(std::string_view key) {
     kv_db_->Delete(write_options_, key);
   }
   if (remove_zset) {
-    std::vector<char> prefix(key.begin(), key.end());
-    prefix.push_back(0);
-    auto prefix_sv = std::string_view(prefix.data(), prefix.size());
-    auto it = std::unique_ptr<rocksdb::Iterator>(
-        zset_db_->NewIterator(get_bulk_read_options()));
-    it->Seek(rocksdb::Slice(prefix.data(), prefix.size()));
-    while (it->Valid()) {
-      auto full_key = it->key();
-      if (!full_key.ToStringView().starts_with(prefix_sv)) {
-        break;
-      }
-      zset_db_->Delete(write_options_, full_key);
-      it->Next();
-    }
+    // std::vector<char> prefix(key.begin(), key.end());
+    // prefix.push_back(0);
+    // auto prefix_sv = std::string_view(prefix.data(), prefix.size());
+    // auto it = std::unique_ptr<rocksdb::Iterator>(
+    //     zset_db_->NewIterator(get_bulk_read_options()));
+    // it->Seek(rocksdb::Slice(prefix.data(), prefix.size()));
+    // while (it->Valid()) {
+    //   auto full_key = it->key();
+    //   if (!full_key.ToStringView().starts_with(prefix_sv)) {
+    //     break;
+    //   }
+    //   zset_db_->Delete(write_options_, full_key);
+    //   it->Next();
+    // }
   }
 }
 
