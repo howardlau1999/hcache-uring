@@ -1491,7 +1491,7 @@ int main(int argc, char *argv[]) {
       loop_started.fetch_add(1);
       loop->waker().detach();
       for (;;) {
-        loop->poll();
+        loop->poll_no_wait();
       }
     });
     thread.detach();
@@ -1503,7 +1503,7 @@ int main(int argc, char *argv[]) {
   http_server(main_loop).detach();
   db_flusher();
   for (;;) {
-    main_loop->poll();
+    main_loop->poll_no_wait();
   }
   return 0;
 }
