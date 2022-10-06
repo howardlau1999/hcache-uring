@@ -1467,8 +1467,8 @@ int main(int argc, char *argv[]) {
   main_loop->waker().detach();
   ::signal(SIGPIPE, SIG_IGN);
   cores = get_cpu_affinity();
-  loops.resize(cores.size());
-  rpc_loops.resize(cores.size());
+  loops.resize(cores.size() * 4);
+  rpc_loops.resize(cores.size() * 4);
   store = std::make_unique<storage>();
   {
     auto kv_thread = std::thread([]() { store->load_kv(); });
@@ -1480,30 +1480,30 @@ int main(int argc, char *argv[]) {
   loop_started.fetch_add(1);
   loops[0] = main_loop;
   rpc_loops[0] = main_loop;
-  for (int i = 1; i < cores.size(); ++i) {
-    auto thread = std::thread([i, core = cores[i]] {
+  for (int i = 1; i < cores.size() * 4; ++i) {
+    auto thread = std::thread([i, core = cores[i % cores.size()]] {
       fmt::print("thread {} bind to core {}\n", i, core);
       bind_cpu(core);
-      auto loop = loop_with_queue::create(8192, IORING_SETUP_ATTACH_WQ,
+      auto loop = loop_with_queue::create(16384, IORING_SETUP_ATTACH_WQ,
                                           main_loop->fd());
       loops[i] = loop;
       rpc_loops[i] = loop;
       loop_started.fetch_add(1);
       loop->waker().detach();
       for (;;) {
-        loop->poll_no_wait();
+        loop->poll();
       }
     });
     thread.detach();
   }
-  while (loop_started.load() != cores.size()) {
+  while (loop_started.load() != cores.size() * 4) {
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
   rpc_server(main_loop, "58080").detach();
   http_server(main_loop).detach();
   db_flusher();
   for (;;) {
-    main_loop->poll_no_wait();
+    main_loop->poll();
   }
   return 0;
 }
