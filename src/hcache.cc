@@ -480,6 +480,7 @@ task<void> handle_rpc(uringpp::socket conn, size_t conn_id) {
       auto t = rpc_reply_empty(conn, req_id);
       uint32_t count = *reinterpret_cast<uint32_t *>(req_p);
       req_p += sizeof(count);
+      auto batch = store->start_batch();
       for (uint32_t i = 0; i < count; i++) {
         uint32_t key_size = *reinterpret_cast<uint32_t *>(req_p);
         req_p += sizeof(key_size);
@@ -489,8 +490,9 @@ task<void> handle_rpc(uringpp::socket conn, size_t conn_id) {
         req_p += sizeof(value_size);
         std::string_view value(req_p, value_size);
         req_p += value_size;
-        store->add(key, value);
+        store->add_batch(batch, key, value);
       }
+      store->commit_batch(batch);
       co_await t;
     } break;
     case method::zadd: {
@@ -1040,35 +1042,29 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
         case 'q': {
           // query
           std::string_view key(path + 7, path_len - 7);
-          auto key_shard = get_shard(key);
-          if (key_shard == me) {
-            auto value = store->query(key);
-            if (!value.has_value()) {
-              co_await send_all(conn, HTTP_404, sizeof(HTTP_404) - 1);
-            } else {
-              co_await send_text(conn, value->data(), value->size());
-            }
+          auto value = store->query(key);
+          if (!value.has_value()) {
+            co_await send_all(conn, HTTP_404, sizeof(HTTP_404) - 1);
           } else {
-            auto value =
-                co_await remote_query(rpc_clients[key_shard][conn_shard], key);
-            if (!value.has_value()) {
-              co_await send_all(conn, HTTP_404, sizeof(HTTP_404) - 1);
-            } else {
-              co_await send_text(conn, (char *)value->second.data(),
-                                 value->second.size());
-            }
+            co_await send_text(conn, value->data(), value->size());
           }
         } break;
         case 'd': {
           // del
           std::string_view key(path + 5, path_len - 5);
           auto key_shard = get_shard(key);
-          if (key_shard == me) {
-            store->del(key);
-          } else {
-            co_await remote_del(rpc_clients[key_shard][conn_shard], key);
+          std::vector<task<void>> tasks;
+          for (auto i = 0; i < nr_peers; ++i) {
+            if (i == me) {
+              store->del(key);
+            } else {
+              tasks.emplace_back(remote_del(rpc_clients[i][conn_shard], key));
+            }
           }
           co_await send_all(conn, EMPTY_RESPONSE, sizeof(EMPTY_RESPONSE) - 1);
+          for (auto &t : tasks) {
+            co_await t;
+          }
         } break;
         case 'z': {
           // zrmv
@@ -1144,16 +1140,18 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
           auto const value = doc["value"].get_string().take_value();
           auto key_shard = get_shard(key);
           bool success = false;
-          if (key_shard == me) {
-            success = store->add(key, value);
-          } else {
-            success = co_await remote_add(rpc_clients[key_shard][conn_shard],
-                                          key, value);
+          std::vector<task<bool>> tasks;
+          for (auto i = 0; i < nr_peers; ++i) {
+            if (i == me) {
+              store->add(key, value);
+            } else {
+              tasks.push_back(
+                  remote_add(rpc_clients[i][conn_shard], key, value));
+            }
           }
-          if (success) {
-            co_await send_all(conn, EMPTY_RESPONSE, sizeof(EMPTY_RESPONSE) - 1);
-          } else {
-            co_await send_all(conn, HTTP_400, sizeof(HTTP_400) - 1);
+          co_await send_all(conn, EMPTY_RESPONSE, sizeof(EMPTY_RESPONSE) - 1);
+          for (auto &t : tasks) {
+            co_await t;
           }
         } break;
         case 'b': {
@@ -1169,10 +1167,11 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
             auto const key = kv["key"].get_string().take_value();
             auto const value = kv["value"].get_string().take_value();
             auto key_shard = get_shard(key);
-            if (key_shard == me) {
-              store->add_batch(batch, key, value);
-            } else {
-              sharded_keys[key_shard][key] = value;
+            for (auto i = 0; i < nr_peers; ++i) {
+              if (i == me) {
+                store->add_batch(batch, key, value);
+              }
+              sharded_keys[i][key] = value;
             }
           }
           std::vector<task<void>> tasks;
@@ -1201,32 +1200,10 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
           std::vector<std::vector<key_value_view>> remote_key_values;
           for (auto &&k : arr) {
             auto key = k.get_string().take_value();
-            auto key_shard = get_shard(key);
-            if (key_shard == me) {
-              keys.insert(key);
-            } else {
-              sharded_keys[key_shard].insert(key);
-            }
+            keys.insert(key);
           }
           auto remote_kv_count = 0;
-          std::vector<std::vector<char>> remote_buffers;
-          std::vector<
-              task<std::pair<std::vector<char>, std::vector<key_value_view>>>>
-              tasks;
-          for (auto key_shard = 0; key_shard < nr_peers; ++key_shard) {
-            if (key_shard == me) {
-              continue;
-            }
-            tasks.emplace_back(remote_list(rpc_clients[key_shard][conn_shard],
-                                           sharded_keys[key_shard]));
-          }
           auto local_key_values = store->list(keys.begin(), keys.end());
-          for (auto &t : tasks) {
-            auto remote_kvs = co_await t;
-            remote_kv_count += remote_kvs.second.size();
-            remote_buffers.emplace_back(std::move(remote_kvs.first));
-            remote_key_values.emplace_back(std::move(remote_kvs.second));
-          }
           if (local_key_values.empty() && remote_kv_count == 0) {
             co_await send_all(conn, HTTP_404, sizeof(HTTP_404) - 1);
           } else {

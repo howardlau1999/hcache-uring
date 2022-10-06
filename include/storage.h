@@ -50,9 +50,13 @@ struct string_hash {
   }
 };
 
-using ankerlkv = ankerl::unordered_dense::map<std::string, std::string, string_hash, std::equal_to<>>;
-using ankerlkvview = ankerl::unordered_dense::map<std::string_view, std::string_view, string_hash, std::equal_to<>>;
-using ankerlkvset = ankerl::unordered_dense::set<std::string_view, string_hash, std::equal_to<>>;
+using ankerlkv = ankerl::unordered_dense::map<std::string, std::string,
+                                              string_hash, std::equal_to<>>;
+using ankerlkvview =
+    ankerl::unordered_dense::map<std::string_view, std::string_view,
+                                 string_hash, std::equal_to<>>;
+using ankerlkvset = ankerl::unordered_dense::set<std::string_view, string_hash,
+                                                 std::equal_to<>>;
 
 template <typename T, typename Q> struct mutable_pair {
   T first;
@@ -229,18 +233,33 @@ public:
   void load_zset();
   bool kv_loaded() const { return kv_initialized_; }
 
-  std::vector<key_view_value>
-  list(ankerlkvset::iterator begin,
-       ankerlkvset::iterator end) {
-    std::vector<key_view_value> ret;
+  std::vector<key_view_value> list(ankerlkvset::iterator begin,
+                                   ankerlkvset::iterator end) {
+    std::vector<rocksdb::Slice> keys;
     for (auto it = begin; it != end; ++it) {
-      if (auto v = query(*it); v.has_value()) {
-        ret.emplace_back(*it, v.value());
+      keys.push_back(rocksdb::Slice(it->data(), it->size()));
+    }
+    std::sort(keys.begin(), keys.end(),
+              [](const rocksdb::Slice &lhs, const rocksdb::Slice &rhs) {
+                return lhs.compare(rhs) < 0;
+              });
+    std::vector<rocksdb::Status> statuses;
+    std::vector<rocksdb::PinnableSlice> values;
+    statuses.resize(keys.size());
+    values.resize(keys.size());
+    rocksdb::ReadOptions read_options;
+    read_options.verify_checksums = false;
+    read_options.async_io = true;
+    kv_db_->MultiGet(read_options, kv_db_->DefaultColumnFamily(), keys.size(),
+                     &keys[0], &values[0], &statuses[0]);
+    std::vector<key_view_value> ret;
+    for (size_t i = 0; i < keys.size(); ++i) {
+      if (statuses[i].ok()) {
+        ret.emplace_back(keys[i].ToStringView(), values[i].ToString());
       }
     }
     return ret;
   }
-
 
   std::optional<std::string> query(std::string_view key);
 

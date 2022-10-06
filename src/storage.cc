@@ -63,6 +63,13 @@ static inline rocksdb::ReadOptions get_bulk_read_options() {
   return read_options;
 }
 
+static inline rocksdb::ReadOptions get_read_options() {
+  rocksdb::ReadOptions read_options;
+  read_options.verify_checksums = false;
+  read_options.async_io = true;
+  return read_options;
+}
+
 void storage::first_time_init() {
   char *init_dirs_env = std::getenv("INIT_DIRS");
   if (init_dirs_env == nullptr) {
@@ -103,11 +110,11 @@ void storage::first_time_init() {
           auto value = it->value();
           auto key_sv = key.ToStringView();
           auto value_sv = value.ToStringView();
-          if (get_shard(key_sv) == me) {
+          // if (get_shard(key_sv) == me) {
             add_no_persist(key_sv, value_sv);
             sst_file_writer.Put(key_sv, value_sv);
             count++;
-          }
+          // }
         }
         cds::threading::Manager::detachThread();
         status = sst_file_writer.Finish();
@@ -145,16 +152,16 @@ void storage::first_time_init() {
 void storage::load_kv() {
   open_kv_db();
   size_t count = 0;
-  fmt::print("Start loading (not first time)\n");
-  auto it = std::unique_ptr<rocksdb::Iterator>(
-      kv_db_->NewIterator(get_bulk_read_options()));
-  for (it->SeekToFirst(); it->Valid(); it->Next()) {
-    auto key = it->key();
-    auto value = it->value();
-    add_no_persist(key.ToStringView(), value.ToStringView());
-    count++;
-  }
-  fmt::print("Loaded {} keys from db\n", count);
+  // fmt::print("Start loading (not first time)\n");
+  // auto it = std::unique_ptr<rocksdb::Iterator>(
+  //     kv_db_->NewIterator(get_bulk_read_options()));
+  // for (it->SeekToFirst(); it->Valid(); it->Next()) {
+  //   auto key = it->key();
+  //   auto value = it->value();
+  //   add_no_persist(key.ToStringView(), value.ToStringView());
+  //   count++;
+  // }
+  // fmt::print("Loaded {} keys from db\n", count);
 }
 
 void storage::flush() {
@@ -197,9 +204,15 @@ size_t storage::get_key_shard(std::string_view key) const {
 
 std::optional<std::string> storage::query(std::string_view key) {
   std::optional<std::string> ret = std::nullopt;
-  kvs_.find(key, [&](auto &kv, ...) {
-    ret = kv.value;
-  });
+  std::string value;
+  auto status = kv_db_->Get(get_read_options(), key, &value);
+  if (status.IsNotFound()) {
+    return ret;
+  }
+  ret = std::move(value);
+  // kvs_.find(key, [&](auto &kv, ...) {
+  //   ret = kv.value;
+  // });
   // auto shard = get_key_shard(key);
   // {
   //   std::shared_lock lock(kvs_mutex_[shard]);
@@ -252,25 +265,25 @@ void storage::commit_batch(rocksdb::WriteBatch *batch) {
 
 void storage::add_batch(rocksdb::WriteBatch *batch, std::string_view key,
                         std::string_view value) {
-  add_no_persist(key, value);
+  // add_no_persist(key, value);
   batch->Put(key, value);
 }
 
 bool storage::add(std::string_view key, std::string_view value) {
-  if (!add_no_persist(key, value)) {
-    return false;
-  }
+  // if (!add_no_persist(key, value)) {
+  //   return false;
+  // }
   kv_db_->Put(write_options_, key, value);
   return true;
 }
 
 void storage::del(std::string_view key) {
-  bool remove_kv = false;
+  bool remove_kv = true;
   bool remove_zset = false;
-  if (auto p = kvs_.erase(key); p) {
-    mi_disposer<key_value_intl>()(p);
-    remove_kv = true;
-  }
+  // if (auto p = kvs_.erase(key); p) {
+  //   mi_disposer<key_value_intl>()(p);
+  //   remove_kv = true;
+  // }
 
   if (auto p = zsets_.erase(key); p) {
     mi_disposer<zset_intl>()(p);
