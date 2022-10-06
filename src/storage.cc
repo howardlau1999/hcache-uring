@@ -246,21 +246,21 @@ rocksdb::WriteBatch *storage::start_batch() {
   return new rocksdb::WriteBatch();
 }
 void storage::commit_batch(rocksdb::WriteBatch *batch) {
-  // kv_db_->Write(write_options_, batch);
+  kv_db_->Write(write_options_, batch);
   delete batch;
 }
 
 void storage::add_batch(rocksdb::WriteBatch *batch, std::string_view key,
                         std::string_view value) {
   add_no_persist(key, value);
-  // batch->Put(key, value);
+  batch->Put(key, value);
 }
 
 bool storage::add(std::string_view key, std::string_view value) {
   if (!add_no_persist(key, value)) {
     return false;
   }
-  // kv_db_->Put(write_options_, key, value);
+  kv_db_->Put(write_options_, key, value);
   return true;
 }
 
@@ -294,7 +294,7 @@ void storage::del(std::string_view key) {
   //   }
   // }
   if (remove_kv) {
-    // kv_db_->Delete(write_options_, key);
+    kv_db_->Delete(write_options_, key);
   }
   if (remove_zset) {
     // std::vector<char> prefix(key.begin(), key.end());
@@ -380,17 +380,17 @@ bool storage::zadd(std::string_view key, std::string_view value,
   //   }
   // }
   bool is_new = zadd_no_persist(key, value, score);
-  // auto full_key = encode_zset_key(key, value);
-  // zset_db_->Put(
-  //     write_options_, rocksdb::Slice(full_key.data(), full_key.size()),
-  //     rocksdb::Slice(reinterpret_cast<const char *>(&score), sizeof(score)));
+  auto full_key = encode_zset_key(key, value);
+  zset_db_->Put(
+      write_options_, rocksdb::Slice(full_key.data(), full_key.size()),
+      rocksdb::Slice(reinterpret_cast<const char *>(&score), sizeof(score)));
   return true;
 }
 
 void storage::zrmv(std::string_view key, std::string_view value) {
   auto full_key = encode_zset_key(key, value);
-  // zset_db_->Delete(write_options_,
-  //                  rocksdb::Slice(full_key.data(), full_key.size()));
+  zset_db_->Delete(write_options_,
+                   rocksdb::Slice(full_key.data(), full_key.size()));
   zsets_.find(key, [key, value](zset_intl &zset, ...) {
     std::lock_guard lock(zset.mutex);
     if (auto it = zset.value_score.find(value); it != zset.value_score.end())
