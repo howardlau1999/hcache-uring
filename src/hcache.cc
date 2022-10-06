@@ -1058,13 +1058,10 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
             if (i == me) {
               store->del(key);
             } else {
-              tasks.emplace_back(remote_del(rpc_clients[i][conn_shard], key));
+              remote_del(rpc_clients[i][conn_shard], key).detach();
             }
           }
           co_await send_all(conn, EMPTY_RESPONSE, sizeof(EMPTY_RESPONSE) - 1);
-          for (auto &t : tasks) {
-            co_await t;
-          }
         } break;
         case 'z': {
           // zrmv
@@ -1085,11 +1082,8 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
             if (i == me) {
               continue;
             }
-            tasks.emplace_back(
-                remote_zrmv(rpc_clients[i][conn_shard], key, value));
-          }
-          for (auto &t : tasks) {
-            co_await t;
+
+            remote_zrmv(rpc_clients[i][conn_shard], key, value).detach();
           }
         } break;
         }
@@ -1145,14 +1139,10 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
             if (i == me) {
               store->add(key, value);
             } else {
-              tasks.push_back(
-                  remote_add(rpc_clients[i][conn_shard], key, value));
+              remote_add(rpc_clients[i][conn_shard], key, value).detach();
             }
           }
           co_await send_all(conn, EMPTY_RESPONSE, sizeof(EMPTY_RESPONSE) - 1);
-          for (auto &t : tasks) {
-            co_await t;
-          }
         } break;
         case 'b': {
           // batch
@@ -1179,13 +1169,11 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
             if (key_shard == me) {
               continue;
             }
-            tasks.emplace_back(remote_batch(rpc_clients[key_shard][conn_shard],
-                                            sharded_keys[key_shard]));
+            remote_batch(rpc_clients[key_shard][conn_shard],
+                         sharded_keys[key_shard])
+                .detach();
           }
           store->commit_batch(batch);
-          for (auto &task : tasks) {
-            co_await task;
-          }
           co_await send_all(conn, EMPTY_RESPONSE, sizeof(EMPTY_RESPONSE) - 1);
         } break;
         case 'l': {
@@ -1301,11 +1289,8 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
               if (i == me) {
                 continue;
               }
-              tasks.emplace_back(
-                  remote_zadd(rpc_clients[i][conn_shard], key, value, score));
-            }
-            for (auto &t : tasks) {
-              co_await t;
+              remote_zadd(rpc_clients[i][conn_shard], key, value, score)
+                  .detach();
             }
           } break;
           case 'r': {
@@ -1433,14 +1418,14 @@ task<void> connect_rpc_client(std::string port) {
 void db_flusher() {
   std::thread([] {
     while (true) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      std::this_thread::sleep_for(std::chrono::milliseconds(1000));
       store->flush();
     }
   }).detach();
 }
 
 int main(int argc, char *argv[]) {
-  main_loop = loop_with_queue::create(8192);
+  main_loop = loop_with_queue::create(16384);
   main_loop->waker().detach();
   ::signal(SIGPIPE, SIG_IGN);
   cores = get_cpu_affinity();
