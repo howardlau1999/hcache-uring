@@ -1044,7 +1044,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
             auto value =
                 co_await remote_query(rpc_clients[key_shard][conn_shard], key);
             if (!value.has_value()) {
-              co_await send_all(conn, HTTP_404, sizeof(HTTP_404) - 1);
+              send_all(conn, HTTP_404, sizeof(HTTP_404) - 1).detach();
             } else {
               co_await send_text(conn, (char *)value->second.data(),
                                  value->second.size());
@@ -1060,7 +1060,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
           } else {
             remote_del(rpc_clients[key_shard][conn_shard], key).detach();
           }
-          co_await send_all(conn, EMPTY_RESPONSE, sizeof(EMPTY_RESPONSE) - 1);
+          send_all(conn, EMPTY_RESPONSE, sizeof(EMPTY_RESPONSE) - 1).detach();
         } break;
         case 'z': {
           // zrmv
@@ -1075,7 +1075,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
           auto const value = std::string_view(slash_ptr, end_ptr - slash_ptr);
           auto key_shard = get_shard(key);
           store->zrmv(key, value);
-          co_await send_all(conn, EMPTY_RESPONSE, sizeof(EMPTY_RESPONSE) - 1);
+          send_all(conn, EMPTY_RESPONSE, sizeof(EMPTY_RESPONSE) - 1).detach();
           for (size_t i = 0; i < nr_peers; ++i) {
             if (i == me) {
               continue;
@@ -1135,7 +1135,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
           } else {
             remote_add(rpc_clients[key_shard][conn_shard], key, value).detach();
           }
-          co_await send_all(conn, EMPTY_RESPONSE, sizeof(EMPTY_RESPONSE) - 1);
+          send_all(conn, EMPTY_RESPONSE, sizeof(EMPTY_RESPONSE) - 1).detach();
         } break;
         case 'b': {
           // batch
@@ -1166,7 +1166,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
                 .detach();
           }
           store->commit_batch(batch);
-          co_await send_all(conn, EMPTY_RESPONSE, sizeof(EMPTY_RESPONSE) - 1);
+          send_all(conn, EMPTY_RESPONSE, sizeof(EMPTY_RESPONSE) - 1).detach();
         } break;
         case 'l': {
           // list
@@ -1207,7 +1207,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
             remote_key_values.emplace_back(std::move(remote_kvs.second));
           }
           if (local_key_values.empty() && remote_kv_count == 0) {
-            co_await send_all(conn, HTTP_404, sizeof(HTTP_404) - 1);
+            send_all(conn, HTTP_404, sizeof(HTTP_404) - 1).detach();
           } else {
             if (local_key_values.size() + remote_kv_count < 10000000) {
               rapidjson::StringBuffer buffer;
@@ -1297,7 +1297,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
             auto score = score_value["score"].get_uint64().take_value();
             auto key_shard = get_shard(key);
             store->zadd(key, value, score);
-            co_await send_all(conn, EMPTY_RESPONSE, sizeof(EMPTY_RESPONSE) - 1);
+            send_all(conn, EMPTY_RESPONSE, sizeof(EMPTY_RESPONSE) - 1).detach();
             std::vector<task<bool>> tasks;
             for (size_t i = 0; i < nr_peers; i++) {
               if (i == me) {
