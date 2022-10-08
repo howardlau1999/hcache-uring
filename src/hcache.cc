@@ -876,7 +876,7 @@ task<void> rpc_server(std::shared_ptr<loop_with_queue> loop, std::string port) {
 template <class It>
 task<void> send_score_values(uringpp::socket &conn, size_t count, It begin,
                              It end) {
-  if (count < 1000000) {
+  if (count < 1024) {
     // zrange
     rapidjson::StringBuffer buffer;
     auto d = rapidjson::Document();
@@ -1145,6 +1145,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
           auto doc = parser.parse(json);
           auto arr = doc.get_array().take_value();
           std::vector<ankerlkvview> sharded_keys(nr_peers);
+          send_all(conn, EMPTY_RESPONSE, sizeof(EMPTY_RESPONSE) - 1).detach();
           auto batch = store->start_batch();
           for (auto &&kv : arr) {
             auto const key = kv["key"].get_string().take_value();
@@ -1166,7 +1167,6 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
                 .detach();
           }
           store->commit_batch(batch);
-          send_all(conn, EMPTY_RESPONSE, sizeof(EMPTY_RESPONSE) - 1).detach();
         } break;
         case 'l': {
           // list
@@ -1209,7 +1209,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
           if (local_key_values.empty() && remote_kv_count == 0) {
             send_all(conn, HTTP_404, sizeof(HTTP_404) - 1).detach();
           } else {
-            if (local_key_values.size() + remote_kv_count < 10000000) {
+            if (local_key_values.size() + remote_kv_count < 1024) {
               rapidjson::StringBuffer buffer;
               {
                 auto d = rapidjson::Document();
