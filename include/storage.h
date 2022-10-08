@@ -19,6 +19,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <optional>
 #include <rocksdb/db.h>
 #include <rocksdb/slice.h>
@@ -50,9 +51,13 @@ struct string_hash {
   }
 };
 
-using ankerlkv = ankerl::unordered_dense::map<std::string, std::string, string_hash, std::equal_to<>>;
-using ankerlkvview = ankerl::unordered_dense::map<std::string_view, std::string_view, string_hash, std::equal_to<>>;
-using ankerlkvset = ankerl::unordered_dense::set<std::string_view, string_hash, std::equal_to<>>;
+using ankerlkv = ankerl::unordered_dense::map<std::string, std::string,
+                                              string_hash, std::equal_to<>>;
+using ankerlkvview =
+    ankerl::unordered_dense::map<std::string_view, std::string_view,
+                                 string_hash, std::equal_to<>>;
+using ankerlkvset = ankerl::unordered_dense::set<std::string_view, string_hash,
+                                                 std::equal_to<>>;
 
 template <typename T, typename Q> struct mutable_pair {
   T first;
@@ -118,6 +123,9 @@ struct zset_stl {
   std::shared_mutex mutex;
   void zadd(uint32_t score, std::string_view value);
 };
+
+using ankerlzset = ankerl::unordered_dense::map<std::string, zset_stl *,
+                                                string_hash, std::equal_to<>>;
 
 struct zset_intl
     : public cds::intrusive::cuckoo::node<cds::intrusive::cuckoo::list, 2>,
@@ -210,12 +218,12 @@ class storage {
   std::atomic<bool> kv_initialized_;
   rocksdb::WriteOptions write_options_;
 
-  // ankerlkv kvs_[nr_shards];
-  // std::shared_mutex kvs_mutex_[nr_shards];
-  // unordered_string_map<std::unique_ptr<zset_stl>> zsets_[nr_shards];
-  // std::shared_mutex zsets_mutex_[nr_shards];
-  kv_cuckoo_set kvs_;
-  zset_cuckoo_set zsets_;
+  ankerlkv kvs_[nr_shards];
+  std::shared_mutex kvs_mutex_[nr_shards];
+  ankerlzset zsets_[nr_shards];
+  std::shared_mutex zsets_mutex_[nr_shards];
+  // kv_cuckoo_set kvs_;
+  // zset_cuckoo_set zsets_;
 
   void open_kv_db();
   size_t get_key_shard(std::string_view key) const;
@@ -229,9 +237,8 @@ public:
   void load_zset();
   bool kv_loaded() const { return kv_initialized_; }
 
-  std::vector<key_view_value>
-  list(ankerlkvset::iterator begin,
-       ankerlkvset::iterator end) {
+  std::vector<key_view_value> list(ankerlkvset::iterator begin,
+                                   ankerlkvset::iterator end) {
     std::vector<key_view_value> ret;
     for (auto it = begin; it != end; ++it) {
       if (auto v = query(*it); v.has_value()) {
@@ -240,7 +247,6 @@ public:
     }
     return ret;
   }
-
 
   std::optional<std::string> query(std::string_view key);
 

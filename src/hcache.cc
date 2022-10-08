@@ -1238,7 +1238,7 @@ task<void> handle_http(uringpp::socket conn, size_t conn_id) {
                 rapidjson::Writer writer(buffer);
                 d.Accept(writer);
               }
-              co_await send_json(conn, std::move(buffer));
+              send_json(conn, std::move(buffer)).detach();
             } else {
               co_await send_all(conn, CHUNK_RESPONSE,
                                 sizeof(CHUNK_RESPONSE) - 1);
